@@ -1,3 +1,4 @@
+pub mod header_check;
 pub mod header_validator;
 pub mod regex_patterns;
 pub mod baseline_file_service;

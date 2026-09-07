@@ -20,11 +20,12 @@ use crate::fit_overlay::{self, FitOverlayFlags};
 enum CalibrationTab {
     ChannelView,
     DataTable,
+    Json,
 }
 
-/// One decoded raw line for the Data Table tab. Each of the 44 block columns
-/// (11 voltage steps x 4 layers L1/L2/L6/L7, matching `calibration_block_fields`)
-/// is pre-joined into a single comma-separated cell of its 16 decoded decimal values.
+/// One decoded raw line for the Data Table tab. `blocks` holds the 44 block
+/// columns (11 voltage steps x 4 layers L1/L2/L6/L7, matching
+/// `calibration_block_fields`), each with its 16 decoded decimal values.
 #[derive(Debug, Clone)]
 struct CalibrationRow {
     packet_sync: String,
@@ -34,13 +35,15 @@ struct CalibrationRow {
     time: DateTime<Utc>,
     data_type: String,
     sample_index: i32,
-    blocks: Vec<String>,
+    blocks: Vec<Vec<i32>>,
     /// Values for `CALIBRATION_TAIL_FIELDS`, in that same order.
     tail: Vec<String>,
     reserved_hex: String,
     checksum_hex: String,
 }
 
+/// Joins one block's 16 decoded values into a comma-separated cell for the
+/// Data Table / CSV export.
 fn join_i32_values(values: &[i32]) -> String {
     values.iter().map(i32::to_string).collect::<Vec<_>>().join(", ")
 }
@@ -55,7 +58,7 @@ impl From<CalibrationLineResult> for CalibrationRow {
             time: r.time,
             data_type: r.data_type,
             sample_index: r.sample_index,
-            blocks: r.blocks.iter().map(|b| join_i32_values(b)).collect(),
+            blocks: r.blocks,
             tail: r.tail,
             reserved_hex: r.reserved_hex,
             checksum_hex: r.checksum_hex,
@@ -129,7 +132,7 @@ fn calibration_row_cells(row: &CalibrationRow) -> Vec<String> {
         row.data_type.clone(),
         row.sample_index.to_string(),
     ];
-    cells.extend(row.blocks.iter().cloned());
+    cells.extend(row.blocks.iter().map(|b| join_i32_values(b)));
     cells.extend(row.tail.iter().cloned());
     cells.push(row.reserved_hex.clone());
     cells.push(row.checksum_hex.clone());
@@ -146,12 +149,86 @@ fn csv_field(value: &str) -> String {
     }
 }
 
+/// Tail keys for the JSON view
+const CALIBRATION_JSON_TAIL_KEYS: [&str; 10] = [
+    "dssd1_temperature",
+    "fee1_current",
+    "fee1_temperature",
+    "dssd7_temperature",
+    "fee2_current",
+    "fee2_temperature",
+    "fee1_threshold",
+    "fee2_threshold",
+    "dssd1_temperature_dup",
+    "dssd4_temperature",
+];
+
+/// Number of voltage steps in the calibration payload (`00v`..`10v`).
+const CALIBRATION_VOLTAGE_STEPS: usize = 11;
+
+/// One Data Table row as a JSON object
+fn calibration_row_json(row: &CalibrationRow) -> serde_json::Value {
+    use crate::json_view::{num_or_str, object};
+
+    let steps = object((0..CALIBRATION_VOLTAGE_STEPS).map(|step| {
+        let base = step * 4;
+        let layers = object(
+            ["l1", "l2", "l6", "l7"]
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    let list = row
+                        .blocks
+                        .get(base + i)
+                        .map(|b| serde_json::Value::from(b.clone()))
+                        .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+                    (name.to_string(), list)
+                }),
+        );
+        (format!("{step:02}v"), layers)
+    }));
+    let tail = object(
+        CALIBRATION_JSON_TAIL_KEYS
+            .iter()
+            .zip(&row.tail)
+            .map(|(k, v)| (k.to_string(), num_or_str(v))),
+    );
+
+    object([
+        (
+            "header".to_string(),
+            object([
+                ("packet_sync_code".to_string(), num_or_str(&row.packet_sync)),
+                ("packet_id".to_string(), row.package_id.into()),
+                ("pakcet_seq".to_string(), row.packet_sequence.into()),
+                ("packet_data_len".to_string(), row.packet_data_length.into()),
+                ("time".to_string(), format_event_time(row.time).into()),
+                ("data_type".to_string(), row.data_type.clone().into()),
+                ("sample_index".to_string(), row.sample_index.into()),
+            ]),
+        ),
+        ("calibration_voltage_step".to_string(), steps),
+        ("tail".to_string(), tail),
+        ("reserved".to_string(), row.reserved_hex.clone().into()),
+        ("checksum".to_string(), row.checksum_hex.clone().into()),
+    ])
+}
+
+fn calibration_rows_json(rows: &[CalibrationRow]) -> Vec<serde_json::Value> {
+    rows.iter().map(calibration_row_json).collect()
+}
+
 enum WorkerMsg {
     Status(String, Color32),
     Busy(bool),
-    HeaderCheck(String),
+    HeaderInfo(String),
     Progress(f64),
     DataLoaded(CalibrationAccumulator),
+    Timing {
+        start: String,
+        stop: String,
+        duration: String,
+    },
     TableRows(Vec<CalibrationRow>),
     Error(String),
 }
@@ -171,7 +248,11 @@ pub struct CalibrationMode {
     status_message: String,
     is_busy: bool,
     progress_value: f64,
-    header_check_status: String,
+    data_counts_str: String,
+    start_time_str: String,
+    stop_time_str: String,
+    duration_str: String,
+    header_info_text: String,
 
     show_gaussian_fit: bool,
     show_hemg_single_fit: bool,
@@ -185,6 +266,8 @@ pub struct CalibrationMode {
     active_tab: CalibrationTab,
     /// Data Table tab
     rows: Vec<CalibrationRow>,
+    /// Pretty-printed JSON of the first rows, for the JSON tab's preview.
+    json_preview: String,
 
     tx: Sender<WorkerMsg>,
     rx: Receiver<WorkerMsg>,
@@ -222,7 +305,11 @@ impl Default for CalibrationMode {
             status_message: "Ready".to_string(),
             is_busy: false,
             progress_value: 0.0,
-            header_check_status: String::new(),
+            data_counts_str: "-".to_string(),
+            start_time_str: "-".to_string(),
+            stop_time_str: "-".to_string(),
+            duration_str: "-".to_string(),
+            header_info_text: String::new(),
             show_gaussian_fit: true,
             show_hemg_single_fit: false,
             show_hemg_double_fit: false,
@@ -232,6 +319,7 @@ impl Default for CalibrationMode {
             channels,
             active_tab: CalibrationTab::ChannelView,
             rows: Vec::new(),
+            json_preview: String::new(),
             tx,
             rx,
         }
@@ -269,6 +357,15 @@ impl CalibrationMode {
                 ui.label("Output File Name:");
                 ui.text_edit_singleline(&mut self.output_file_name);
             });
+
+            if !self.header_info_text.is_empty() {
+                ui.collapsing("Header Info", |ui| {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&self.header_info_text).monospace())
+                            .wrap(),
+                    );
+                });
+            }
 
             ui.horizontal(|ui| {
                 if ui
@@ -374,15 +471,21 @@ impl CalibrationMode {
                     egui::ProgressBar::new((self.progress_value / 100.0) as f32).show_percentage(),
                 );
             }
-            if !self.header_check_status.is_empty() {
-                ui.label(&self.header_check_status);
-            }
+            ui.label(format!("Data counts: {}", self.data_counts_str));
+            ui.add(
+                egui::Label::new(format!(
+                    "Start: {}  Stop: {}  Duration: {}",
+                    self.start_time_str, self.stop_time_str, self.duration_str
+                ))
+                .wrap(),
+            );
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.active_tab, CalibrationTab::ChannelView, "Channel View");
                 ui.selectable_value(&mut self.active_tab, CalibrationTab::DataTable, "Data Table");
+                ui.selectable_value(&mut self.active_tab, CalibrationTab::Json, "JSON");
             });
             ui.separator();
 
@@ -397,6 +500,7 @@ impl CalibrationMode {
                     });
                 }
                 CalibrationTab::DataTable => self.data_table_ui(ui),
+                CalibrationTab::Json => self.json_tab_ui(ui),
             }
         });
 
@@ -410,13 +514,27 @@ impl CalibrationMode {
             match msg {
                 WorkerMsg::Status(s, _c) => self.status_message = s,
                 WorkerMsg::Busy(b) => self.is_busy = b,
-                WorkerMsg::HeaderCheck(s) => self.header_check_status = s,
+                WorkerMsg::HeaderInfo(s) => self.header_info_text = s,
                 WorkerMsg::Progress(p) => self.progress_value = p,
                 WorkerMsg::DataLoaded(acc) => {
                     self.accumulator = acc;
                     self.update_plots(true);
                 }
-                WorkerMsg::TableRows(rows) => self.rows = rows,
+                WorkerMsg::Timing {
+                    start,
+                    stop,
+                    duration,
+                } => {
+                    self.start_time_str = start;
+                    self.stop_time_str = stop;
+                    self.duration_str = duration;
+                }
+                WorkerMsg::TableRows(rows) => {
+                    self.data_counts_str = rows.len().to_string();
+                    self.json_preview =
+                        crate::json_view::preview_string(&calibration_rows_json(&rows));
+                    self.rows = rows;
+                }
                 WorkerMsg::Error(e) => {
                     self.status_message = e;
                     self.is_busy = false;
@@ -429,7 +547,12 @@ impl CalibrationMode {
         self.input_files.clear();
         self.input_files_info = "No files selected".to_string();
         self.accumulator = CalibrationAccumulator::default();
+        self.data_counts_str = "-".to_string();
+        self.start_time_str = "-".to_string();
+        self.stop_time_str = "-".to_string();
+        self.duration_str = "-".to_string();
         self.rows.clear();
+        self.json_preview.clear();
         for ch in &mut self.channels {
             ch.counts.clear();
             ch.bin_centers.clear();
@@ -442,7 +565,7 @@ impl CalibrationMode {
         }
         self.status_message = "Reset complete.".to_string();
         self.progress_value = 0.0;
-        self.header_check_status.clear();
+        self.header_info_text.clear();
     }
 
     fn select_files(&mut self) {
@@ -457,11 +580,16 @@ impl CalibrationMode {
     }
 
     fn check_header(&mut self) {
+        let Some(file_path) = self.input_files.first().cloned() else {
+            self.status_message = "Please select files first.".to_string();
+            return;
+        };
         self.is_busy = true;
-        self.header_check_status = "Checking...".to_string();
-        let output_name = self.output_file_name.clone();
+        self.header_info_text = "Analyzing File Structure (Head & Tail)...".to_string();
+        let delay_time = self.delay_time;
+        let threshold = self.threshold;
         let tx = self.tx.clone();
-        std::thread::spawn(move || header_check_worker(output_name, tx));
+        std::thread::spawn(move || check_header_worker(file_path, delay_time, threshold, tx));
     }
 
     fn process_data(&mut self) {
@@ -474,25 +602,19 @@ impl CalibrationMode {
     }
 
     fn read_data(&mut self) {
+        if self.input_files.is_empty() {
+            self.status_message = "Select raw .txt files first.".to_string();
+            return;
+        }
         self.is_busy = true;
         self.progress_value = 0.0;
         self.accumulator = CalibrationAccumulator::default();
         self.rows.clear();
+        self.json_preview.clear();
 
-        let files_to_read = match io::file_helper::find_excel_file(&self.output_file_name, "Calibration") {
-            Some(f) => vec![f],
-            None => {
-                self.status_message = format!(
-                    "File not found: {}.xlsx (searched Documents/DSSD_Analysis/Calibration and legacy locations)",
-                    self.output_file_name
-                );
-                self.is_busy = false;
-                return;
-            }
-        };
-
+        let files = self.input_files.clone();
         let tx = self.tx.clone();
-        std::thread::spawn(move || read_data_worker(files_to_read, tx));
+        std::thread::spawn(move || read_data_worker(files, tx));
     }
 
     /// Rebuilds histograms for the selected layer/axis
@@ -612,6 +734,23 @@ impl CalibrationMode {
             Err(e) => self.status_message = format!("Failed to export CSV: {e}"),
         }
     }
+
+    /// JSON tab: the decoded rows as JSON with preview and downloader
+    fn json_tab_ui(&mut self, ui: &mut egui::Ui) {
+        if crate::json_view::json_tab_ui(ui, self.rows.len(), &self.json_preview) {
+            match crate::json_view::save_json(
+                "calibration_data.json",
+                &calibration_rows_json(&self.rows),
+            ) {
+                Ok(Some(path)) => {
+                    self.status_message =
+                        format!("Saved {} row(s) to {}", self.rows.len(), path.display())
+                }
+                Ok(None) => {}
+                Err(e) => self.status_message = format!("Failed to save JSON: {e}"),
+            }
+        }
+    }
 }
 
 fn process_data_worker(files: Vec<PathBuf>, output_name: String, tx: Sender<WorkerMsg>) {
@@ -655,110 +794,93 @@ fn process_data_worker(files: Vec<PathBuf>, output_name: String, tx: Sender<Work
     let _ = tx.send(WorkerMsg::Busy(false));
 }
 
+/// Decodes the selected raw `.txt` files directly (no Excel round-trip):
+/// filters E225 segments, then decodes each into the accumulator + a
+/// `CalibrationRow` that feeds the Data Table and JSON tabs.
 fn read_data_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>) {
-    let mut accumulator = CalibrationAccumulator::default();
-    accumulator.reset(1_000_000);
-    let mut table_rows: Vec<CalibrationRow> = Vec::new();
+    let start = chrono::Local::now();
 
-    let mut header_ok = true;
-    let file_count = files.len();
-
-    for (file_index, file) in files.iter().enumerate() {
-        let rows = match io::excel::read_excel_column_a(file) {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = tx.send(WorkerMsg::Error(format!("Error: {e}")));
-                let _ = tx.send(WorkerMsg::Busy(false));
-                return;
-            }
-        };
-        let total_rows = rows.len();
-
-        for (row_index, hex_string) in rows.iter().enumerate() {
-            let hex_data = split_hex_data(hex_string);
-
-            if file_index == 0 && row_index == 0 {
-                let valid = validate_header(&hex_data);
-                let _ = tx.send(WorkerMsg::HeaderCheck(if valid {
-                    "Checksum OK".to_string()
-                } else {
-                    "Checksum Mismatch".to_string()
-                }));
-                if !valid {
-                    header_ok = false;
-                    break;
-                }
-            }
-
-            accumulator.process_calibration(&hex_data);
-            if let Some(line) = parse_calibration_line(&hex_data) {
-                table_rows.push(line.into());
-            }
-
-            if row_index % 1000 == 0 {
-                let progress = (row_index as f64 / total_rows.max(1) as f64) * 100.0;
-                let _ = tx.send(WorkerMsg::Progress(progress));
-                let _ = tx.send(WorkerMsg::Status(
-                    format!(
-                        "File {}/{}: {}/{} rows",
-                        file_index + 1,
-                        file_count,
-                        row_index,
-                        total_rows
-                    ),
-                    Color32::GRAY,
-                ));
-            }
+    let segments = match io::segment_filter::filter_e225_segments_from_files(
+        &files,
+        AppConstants::SEGMENT_HEX_LENGTH,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = tx.send(WorkerMsg::Error(format!("Error: {e}")));
+            let _ = tx.send(WorkerMsg::Busy(false));
+            return;
         }
+    };
 
-        if !header_ok {
-            break;
-        }
-    }
-
-    if !header_ok {
+    if segments.is_empty() {
         let _ = tx.send(WorkerMsg::Status(
-            "Stopped: Checksum Mismatch".to_string(),
+            "No valid E225 segments found.".to_string(),
             Color32::RED,
         ));
         let _ = tx.send(WorkerMsg::Busy(false));
         return;
     }
 
+    let total = segments.len();
+    let mut accumulator = CalibrationAccumulator::default();
+    accumulator.reset(total.max(1));
+    let mut table_rows: Vec<CalibrationRow> = Vec::with_capacity(total);
+
+    for (index, segment) in segments.iter().enumerate() {
+        let hex_data = split_hex_data(segment);
+
+        if index == 0 {
+            let valid = validate_header(&hex_data);
+            let _ = tx.send(WorkerMsg::Status(
+                if valid {
+                    "Checksum OK. Reading data...".to_string()
+                } else {
+                    "Checksum Mismatch. Reading data...".to_string()
+                },
+                if valid { Color32::GRAY } else { Color32::RED },
+            ));
+        }
+
+        accumulator.process_calibration(&hex_data);
+        if let Some(line) = parse_calibration_line(&hex_data) {
+            table_rows.push(line.into());
+        }
+
+        if index % 1000 == 0 {
+            let progress = (index as f64 / total.max(1) as f64) * 100.0;
+            let _ = tx.send(WorkerMsg::Progress(progress));
+            let _ = tx.send(WorkerMsg::Status(
+                format!("Reading data: {index}/{total} segments"),
+                Color32::GRAY,
+            ));
+        }
+    }
+
     let _ = tx.send(WorkerMsg::DataLoaded(accumulator));
     let _ = tx.send(WorkerMsg::TableRows(table_rows));
 
+    let stop = chrono::Local::now();
+    let duration = stop.signed_duration_since(start);
+    let _ = tx.send(WorkerMsg::Timing {
+        start: start.format("%H:%M:%S").to_string(),
+        stop: stop.format("%H:%M:%S").to_string(),
+        duration: format!("{} ms", duration.num_milliseconds()),
+    });
     let _ = tx.send(WorkerMsg::Status(
-        "Complete!".to_string(),
+        format!("Processed {total} events."),
         Color32::from_rgb(50, 200, 50),
     ));
     let _ = tx.send(WorkerMsg::Progress(100.0));
     let _ = tx.send(WorkerMsg::Busy(false));
 }
 
-fn header_check_worker(output_name: String, tx: Sender<WorkerMsg>) {
-    let Some(file_path) = io::file_helper::find_excel_file(&output_name, "Calibration") else {
-        let _ = tx.send(WorkerMsg::Error(format!(
-            "File not found: {output_name}.xlsx (searched Documents/DSSD_Analysis/Calibration and legacy locations)"
-        )));
-        let _ = tx.send(WorkerMsg::Busy(false));
-        return;
-    };
-
-    match io::excel::read_excel_column_a(&file_path) {
-        Ok(rows) => {
-            let mut result = "Header is correct!".to_string();
-            for (i, hex) in rows.iter().enumerate() {
-                if !hex.starts_with(AppConstants::HEADER_START) {
-                    result = format!("Header is INCORRECT! at data row no. {}", i + 1);
-                    break;
-                }
-            }
-            let _ = tx.send(WorkerMsg::HeaderCheck(result));
-        }
-        Err(e) => {
-            let _ = tx.send(WorkerMsg::Error(format!("Error reading file: {e}")));
-        }
-    }
+fn check_header_worker(file_path: PathBuf, delay_time: i32, threshold: i32, tx: Sender<WorkerMsg>) {
+    let text = io::header_check::check_header_summary(&file_path, delay_time, threshold as f64)
+        .unwrap_or_else(|e| format!("Error: {e}"));
+    let _ = tx.send(WorkerMsg::HeaderInfo(text));
+    let _ = tx.send(WorkerMsg::Status(
+        "Header Analysis Complete.".to_string(),
+        Color32::GRAY,
+    ));
     let _ = tx.send(WorkerMsg::Busy(false));
 }

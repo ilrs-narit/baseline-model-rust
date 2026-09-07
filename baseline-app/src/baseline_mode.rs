@@ -10,7 +10,7 @@ use baseline_core::models::shared::AppConstants;
 use baseline_core::observation::data_processor::split_hex_data;
 use chrono::{DateTime, Utc};
 use egui::Color32;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
 use crate::channel::{channel_block_ui, ChannelState};
@@ -20,10 +20,12 @@ use crate::fit_overlay::{self, FitOverlayFlags};
 enum BaselineTab {
     ChannelView,
     DataTable,
+    Json,
 }
 
 /// One decoded raw line for the Data Table tab. Each of the 16
-/// Data-Acquisition blocks per layer (L1/L2/L6/L7) is its own cell, holding
+/// Data-Acquisition blocks per layer (L1/L2/L6/L7) holds 16 decoded
+/// per-channel values.
 #[derive(Debug, Clone)]
 struct BaselineRow {
     packet_sync: String,
@@ -33,10 +35,10 @@ struct BaselineRow {
     time: DateTime<Utc>,
     data_type: String,
     sample_index: i32,
-    l1_blocks: Vec<String>,
-    l2_blocks: Vec<String>,
-    l6_blocks: Vec<String>,
-    l7_blocks: Vec<String>,
+    l1_blocks: Vec<Vec<i32>>,
+    l2_blocks: Vec<Vec<i32>>,
+    l6_blocks: Vec<Vec<i32>>,
+    l7_blocks: Vec<Vec<i32>>,
     /// Values for `BASELINE_TAIL_FIELDS`, in that same order.
     tail: Vec<String>,
     reserved_hex: String,
@@ -131,6 +133,12 @@ fn baseline_table_headers() -> Vec<String> {
     headers
 }
 
+/// Joins one block's 16 decoded values into a comma-separated cell for the
+/// Data Table / CSV export.
+fn join_i32_values(values: &[i32]) -> String {
+    values.iter().map(i32::to_string).collect::<Vec<_>>().join(", ")
+}
+
 /// One row's cells for the Data Table tab and its CSV export
 fn baseline_row_cells(row: &BaselineRow) -> Vec<String> {
     let mut cells = vec![
@@ -143,7 +151,7 @@ fn baseline_row_cells(row: &BaselineRow) -> Vec<String> {
         row.sample_index.to_string(),
     ];
     for blocks in [&row.l1_blocks, &row.l2_blocks, &row.l6_blocks, &row.l7_blocks] {
-        cells.extend(blocks.iter().cloned());
+        cells.extend(blocks.iter().map(|b| join_i32_values(b)));
     }
     cells.extend(row.tail.iter().cloned());
     cells.push(row.reserved_hex.clone());
@@ -159,6 +167,77 @@ fn csv_field(value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+/// Tail keys for the JSON view
+const BASELINE_JSON_TAIL_KEYS: [&str; 10] = [
+    "dssd1_temperature",
+    "fee1_current",
+    "fee1_temperature",
+    "dssd7_temperature",
+    "fee2_current",
+    "fee2_temperature",
+    "fee1_threshold",
+    "fee2_threshold",
+    "dssd1_temperature_dup",
+    "dssd4_temperature",
+];
+
+/// One Data Table row as a JSON object matching
+fn baseline_row_json(row: &BaselineRow) -> serde_json::Value {
+    use crate::json_view::{num_or_str, object};
+
+    let layer_blocks = |blocks: &[Vec<i32>]| {
+        object(
+            blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (format!("block_{}", i + 1), serde_json::Value::from(b.clone()))),
+        )
+    };
+    let tail = object(
+        BASELINE_JSON_TAIL_KEYS
+            .iter()
+            .zip(&row.tail)
+            .map(|(k, v)| (k.to_string(), num_or_str(v))),
+    );
+
+    object([
+        (
+            "header".to_string(),
+            object([
+                ("packet_sync_code".to_string(), num_or_str(&row.packet_sync)),
+                ("packet_id".to_string(), row.package_id.into()),
+                ("pakcet_seq".to_string(), row.packet_sequence.into()),
+                (
+                    "packet_data_len".to_string(),
+                    row.packet_data_length.into(),
+                ),
+                (
+                    "time".to_string(),
+                    format_event_time(row.time).into(),
+                ),
+                ("data_type".to_string(), row.data_type.clone().into()),
+                ("sample_index".to_string(), row.sample_index.into()),
+            ]),
+        ),
+        (
+            "data_acquisition".to_string(),
+            object([
+                ("l1".to_string(), layer_blocks(&row.l1_blocks)),
+                ("l2".to_string(), layer_blocks(&row.l2_blocks)),
+                ("l6".to_string(), layer_blocks(&row.l6_blocks)),
+                ("l7".to_string(), layer_blocks(&row.l7_blocks)),
+            ]),
+        ),
+        ("tail".to_string(), tail),
+        ("reserved".to_string(), row.reserved_hex.clone().into()),
+        ("checksum".to_string(), row.checksum_hex.clone().into()),
+    ])
+}
+
+fn baseline_rows_json(rows: &[BaselineRow]) -> Vec<serde_json::Value> {
+    rows.iter().map(baseline_row_json).collect()
 }
 
 enum WorkerMsg {
@@ -244,6 +323,8 @@ pub struct BaselineMode {
     active_tab: BaselineTab,
     /// Data Table tab
     rows: Vec<BaselineRow>,
+    /// Pretty-printed JSON of the first rows, for the JSON tab's preview.
+    json_preview: String,
 
     tx: Sender<WorkerMsg>,
     rx: Receiver<WorkerMsg>,
@@ -295,6 +376,7 @@ impl Default for BaselineMode {
             channels,
             active_tab: BaselineTab::ChannelView,
             rows: Vec::new(),
+            json_preview: String::new(),
             tx,
             rx,
         }
@@ -335,6 +417,7 @@ impl BaselineMode {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.active_tab, BaselineTab::ChannelView, "Channel View");
                 ui.selectable_value(&mut self.active_tab, BaselineTab::DataTable, "Data Table");
+                ui.selectable_value(&mut self.active_tab, BaselineTab::Json, "JSON");
             });
             ui.separator();
 
@@ -349,6 +432,7 @@ impl BaselineMode {
                     });
                 }
                 BaselineTab::DataTable => self.data_table_ui(ui),
+                BaselineTab::Json => self.json_tab_ui(ui),
             }
         });
 
@@ -388,7 +472,10 @@ impl BaselineMode {
                     self.duration_str = duration;
                     self.can_save_mean = true;
                 }
-                WorkerMsg::TableRows(rows) => self.rows = rows,
+                WorkerMsg::TableRows(rows) => {
+                    self.json_preview = crate::json_view::preview_string(&baseline_rows_json(&rows));
+                    self.rows = rows;
+                }
                 WorkerMsg::Error(e) => {
                     self.status_message = e;
                     self.status_color = Color32::RED;
@@ -610,6 +697,7 @@ impl BaselineMode {
         self.processed_data.clear();
         self.data_counts_str = "-".to_string();
         self.rows.clear();
+        self.json_preview.clear();
         for (i, ch) in self.channels.iter_mut().enumerate() {
             *ch = ChannelState {
                 channel_index: i,
@@ -670,10 +758,9 @@ impl BaselineMode {
         self.status_color = Color32::from_rgb(255, 165, 0);
 
         let files = self.selected_files.clone();
-        let output_dir = self.output_directory_path.clone();
         let output_file_name = self.output_file_name.clone();
         let tx = self.tx.clone();
-        std::thread::spawn(move || pre_process_worker(files, output_dir, output_file_name, tx));
+        std::thread::spawn(move || pre_process_worker(files, output_file_name, tx));
     }
 
     fn process_data(&mut self) {
@@ -720,7 +807,7 @@ impl BaselineMode {
         self.is_busy = true;
         self.progress_value = 0.0;
         self.status_message = "Refitting...".to_string();
-        self.status_color = Color32::from_rgb(255, 165, 0);
+        self.status_color = Color32::GRAY;
         let flags = FitFlags {
             gaussian: self.show_gaussian_fit,
             hemg_single: self.show_hemg_single_fit,
@@ -828,6 +915,20 @@ impl BaselineMode {
             Err(e) => self.status_message = format!("Failed to export CSV: {e}"),
         }
     }
+
+    /// JSON tab: the decoded rows as JSON with preview and downloader
+    fn json_tab_ui(&mut self, ui: &mut egui::Ui) {
+        if crate::json_view::json_tab_ui(ui, self.rows.len(), &self.json_preview) {
+            match crate::json_view::save_json("baseline_data.json", &baseline_rows_json(&self.rows)) {
+                Ok(Some(path)) => {
+                    self.status_message =
+                        format!("Saved {} row(s) to {}", self.rows.len(), path.display())
+                }
+                Ok(None) => {}
+                Err(e) => self.status_message = format!("Failed to save JSON: {e}"),
+            }
+        }
+    }
 }
 
 // Background workers
@@ -909,7 +1010,7 @@ fn recompute_fits_worker(snapshots: Vec<ChannelSnapshot>, flags: FitFlags, tx: S
     }
     let _ = tx.send(WorkerMsg::Status(
         "Refit complete.".to_string(),
-        Color32::from_rgb(50, 200, 50),
+        Color32::GRAY,
     ));
     let _ = tx.send(WorkerMsg::Progress(100.0));
     let _ = tx.send(WorkerMsg::Busy(false));
@@ -965,7 +1066,7 @@ fn merge_files_worker(files: Vec<PathBuf>, output_dir: PathBuf, tx: Sender<Worke
             ));
             let _ = tx.send(WorkerMsg::Status(
                 "Merge Complete. Ready.".to_string(),
-                Color32::from_rgb(50, 200, 50),
+                Color32::GRAY,
             ));
         }
         Err(e) => {
@@ -975,18 +1076,13 @@ fn merge_files_worker(files: Vec<PathBuf>, output_dir: PathBuf, tx: Sender<Worke
     let _ = tx.send(WorkerMsg::Busy(false));
 }
 
-fn pre_process_worker(
-    files: Vec<PathBuf>,
-    output_dir: PathBuf,
-    output_file_name: String,
-    tx: Sender<WorkerMsg>,
-) {
+fn pre_process_worker(files: Vec<PathBuf>, output_file_name: String, tx: Sender<WorkerMsg>) {
     let mut all_data = Vec::new();
 
     for (i, file) in files.iter().enumerate() {
         let _ = tx.send(WorkerMsg::Status(
             format!("Processing file {}/{}...", i + 1, files.len()),
-            Color32::from_rgb(255, 165, 0),
+            Color32::GRAY,
         ));
         match io::process_file_stream(file, None) {
             Ok(mut data) => all_data.append(&mut data),
@@ -1007,32 +1103,28 @@ fn pre_process_worker(
         return;
     }
 
-    let mut file_name = output_file_name;
-    if !file_name.to_ascii_lowercase().ends_with(".xlsx") {
-        file_name.push_str(".xlsx");
-    }
-
-    let today = chrono::Local::now().date_naive();
-    let dir =
-        match baseline_core::baseline_processing::get_daily_output_directory(&output_dir, today) {
-            Ok(d) => d,
-            Err(e) => {
-                let _ = tx.send(WorkerMsg::Error(e.to_string()));
-                let _ = tx.send(WorkerMsg::Busy(false));
-                return;
-            }
-        };
-    let full_path = dir.join(&file_name);
+    let full_path = match io::file_helper::resolve_excel_save_path(&output_file_name, "Baseline") {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = tx.send(WorkerMsg::Error(e));
+            let _ = tx.send(WorkerMsg::Busy(false));
+            return;
+        }
+    };
 
     let _ = tx.send(WorkerMsg::Status(
         "Saving to Excel...".to_string(),
-        Color32::from_rgb(255, 165, 0),
+        Color32::GRAY,
     ));
     match io::excel::save_baseline_to_excel(&all_data, &full_path) {
         Ok(()) => {
             let _ = tx.send(WorkerMsg::Status(
-                format!("Saved {} events to {}", all_data.len(), file_name),
-                Color32::from_rgb(50, 200, 50),
+                format!(
+                    "Saved {} events to {}",
+                    all_data.len(),
+                    full_path.display()
+                ),
+                Color32::GRAY,
             ));
         }
         Err(e) => {
@@ -1050,34 +1142,17 @@ fn process_data_worker(
 ) {
     let start = chrono::Local::now();
 
-    let mut file_name = output_file_name;
-    if !file_name.to_ascii_lowercase().ends_with(".xlsx") {
-        file_name.push_str(".xlsx");
-    }
-    let today = chrono::Local::now().date_naive();
-    let dir =
-        match baseline_core::baseline_processing::get_daily_output_directory(&output_dir, today) {
-            Ok(d) => d,
-            Err(e) => {
-                let _ = tx.send(WorkerMsg::Error(e.to_string()));
-                let _ = tx.send(WorkerMsg::Busy(false));
-                return;
-            }
-        };
-    let full_path = dir.join(&file_name);
-
-    if !full_path.exists() {
+    let Some(full_path) = io::file_helper::find_excel_file(&output_file_name, "Baseline") else {
         let _ = tx.send(WorkerMsg::Error(format!(
-            "Expected input file not found: {}. Please run 'Pre-Process to Excel' first.",
-            full_path.display()
+            "File not found: {output_file_name}.xlsx (searched Documents/DSSD_Analysis/Baseline and legacy locations). Please run 'Pre-Process to Excel' first."
         )));
         let _ = tx.send(WorkerMsg::Busy(false));
         return;
-    }
+    };
 
     let _ = tx.send(WorkerMsg::Status(
         "Reading Excel...".to_string(),
-        Color32::from_rgb(255, 165, 0),
+        Color32::GRAY,
     ));
     let data = match io::excel::read_baseline_excel(&full_path) {
         Ok(d) => d,
@@ -1097,7 +1172,16 @@ fn process_data_worker(
     }
 
     let math = MathService::new();
-    let output_dir_for_means = dir.clone();
+    let today = chrono::Local::now().date_naive();
+    let output_dir_for_means =
+        match baseline_core::baseline_processing::get_daily_output_directory(&output_dir, today) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = tx.send(WorkerMsg::Error(e.to_string()));
+                let _ = tx.send(WorkerMsg::Busy(false));
+                return;
+            }
+        };
 
     use rayon::prelude::*;
     let results: Vec<(usize, ChannelState)> = (0..16usize)
@@ -1196,7 +1280,7 @@ fn process_data_worker(
     });
     let _ = tx.send(WorkerMsg::Status(
         format!("Processed {} events.", data.len()),
-        Color32::from_rgb(50, 200, 50),
+        Color32::GRAY,
     ));
     let _ = tx.send(WorkerMsg::Progress(100.0));
     let _ = tx.send(WorkerMsg::Busy(false));
@@ -1230,7 +1314,7 @@ fn save_mean_worker(data: Vec<BaselineData>, output_dir: PathBuf, tx: Sender<Wor
 
     let _ = tx.send(WorkerMsg::Status(
         "Mean Values Saved Successfully.".to_string(),
-        Color32::from_rgb(50, 200, 50),
+        Color32::GRAY,
     ));
     let _ = tx.send(WorkerMsg::Busy(false));
 }
@@ -1278,7 +1362,7 @@ fn read_data_table_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>) {
     let _ = tx.send(WorkerMsg::TableRows(table_rows));
     let _ = tx.send(WorkerMsg::Status(
         format!("Data table ready: {row_count} row(s)."),
-        Color32::from_rgb(50, 200, 50),
+        Color32::GRAY,
     ));
     let _ = tx.send(WorkerMsg::Progress(100.0));
     let _ = tx.send(WorkerMsg::Busy(false));
@@ -1290,7 +1374,7 @@ fn check_header_worker(
     k_factor: f64,
     tx: Sender<WorkerMsg>,
 ) {
-    let text = check_header_summary(&file_path, delay_time_ms, k_factor)
+    let text = io::header_check::check_header_summary(&file_path, delay_time_ms, k_factor)
         .unwrap_or_else(|e| format!("Error: {e}"));
     let _ = tx.send(WorkerMsg::HeaderInfo(text));
     let _ = tx.send(WorkerMsg::Status(
@@ -1298,120 +1382,4 @@ fn check_header_worker(
         Color32::GRAY,
     ));
     let _ = tx.send(WorkerMsg::Busy(false));
-}
-
-/// Matches `CheckHeader` + `ReadFileBlock`/`ParseHeaderSummary`: reads the
-/// first ~16KB and last ~16KB of the file as hex text and summarizes the
-/// first/last packet timestamps.
-fn check_header_summary(path: &Path, delay_time_ms: i32, k_factor: f64) -> std::io::Result<String> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    const BUFFER_SIZE: usize = 16384;
-    let file_len = std::fs::metadata(path)?.len();
-
-    let mut file = std::fs::File::open(path)?;
-    let mut head_buf = vec![0u8; BUFFER_SIZE.min(file_len as usize)];
-    file.read_exact(&mut head_buf)?;
-    let head_hex = String::from_utf8_lossy(&head_buf).to_string();
-
-    let seek_pos = file_len.saturating_sub(BUFFER_SIZE as u64);
-    file.seek(SeekFrom::Start(seek_pos))?;
-    let mut tail_buf = Vec::new();
-    file.read_to_end(&mut tail_buf)?;
-    let tail_hex = String::from_utf8_lossy(&tail_buf).to_string();
-
-    let mut out = String::new();
-    out.push_str(&format!(
-        "File Size: {:.2} MB\n",
-        file_len as f64 / (1024.0 * 1024.0)
-    ));
-    out.push_str("--------------------------------------------------\n");
-    out.push_str("[START OF FILE]\n");
-    match parse_first_packet(&head_hex) {
-        Some(bytes) => out.push_str(&parse_header_summary(&bytes)),
-        None => out.push_str("Error: Could not read start of file."),
-    }
-    out.push('\n');
-    out.push_str("--------------------------------------------------\n");
-    out.push_str("[END OF FILE]\n");
-    match find_last_packet(&tail_hex) {
-        Some(bytes) => out.push_str(&parse_header_summary(&bytes)),
-        None => out.push_str("Warning: Could not identify a valid packet at the end of file.\n(File might be truncated or format is inconsistent)"),
-    }
-    out.push('\n');
-    out.push_str("--------------------------------------------------\n");
-    out.push_str(&format!("Delay Time: {delay_time_ms}\n"));
-    out.push_str(&format!("Threshold: {k_factor}\n"));
-
-    Ok(out)
-}
-
-fn clean_hex(s: &str) -> String {
-    s.chars().filter(|c| !c.is_whitespace()).collect()
-}
-
-fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
-        .collect()
-}
-
-fn parse_first_packet(hex_content: &str) -> Option<Vec<u8>> {
-    if hex_content.is_empty() {
-        return None;
-    }
-    let mut clean = clean_hex(hex_content);
-    if clean.len() > 4128 {
-        clean.truncate(4128);
-    }
-    if !clean.len().is_multiple_of(2) {
-        clean.pop();
-    }
-    hex_to_bytes(&clean)
-}
-
-fn find_last_packet(hex_content: &str) -> Option<Vec<u8>> {
-    if hex_content.is_empty() {
-        return None;
-    }
-    let clean = clean_hex(hex_content);
-    let upper = clean.to_ascii_uppercase();
-    let last_index = upper.rfind("AA55")?;
-
-    let expected_hex_length = 4128;
-    if last_index + expected_hex_length <= clean.len() {
-        hex_to_bytes(&clean[last_index..last_index + expected_hex_length])
-    } else {
-        let mut partial = clean[last_index..].to_string();
-        if !partial.len().is_multiple_of(2) {
-            partial.pop();
-        }
-        hex_to_bytes(&partial)
-    }
-}
-
-fn parse_header_summary(data: &[u8]) -> String {
-    if data.len() < 14 {
-        return "Invalid/Incomplete Packet Data".to_string();
-    }
-    let seconds_part = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-    let milliseconds_part = ((data[13] as u16) << 8) | data[12] as u16;
-
-    let total_ms = seconds_part as i64 * 1000 + milliseconds_part as i64;
-    let dt =
-        chrono::DateTime::from_timestamp(total_ms / 1000, ((total_ms % 1000) * 1_000_000) as u32)
-            .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
-
-    format!(
-        "Timestamp: {} (UTC)\nSync Code: {:02X} {:02X}\nSeq No:    {:02X} {:02X}",
-        dt.format("%Y-%b-%d %H:%M:%S%.3f"),
-        data[0],
-        data[1],
-        data[4],
-        data[5]
-    )
 }
