@@ -187,13 +187,17 @@ fn flux_row_json(row: &FluxRow) -> serde_json::Value {
             ("particle_time".to_string(), row.particle_time.into()),
         ]),
     )];
-    for (i, count) in row.particle_counts.iter().enumerate() {
-        pairs.push((format!("particle_counts_l{}", i + 1), (*count).into()));
-    }
-    pairs.push((
+    let mut information: Vec<(String, serde_json::Value)> = row
+        .particle_counts
+        .iter()
+        .enumerate()
+        .map(|(i, count)| (format!("particle_counts_l{}", i + 1), (*count).into()))
+        .collect();
+    information.push((
         "particle_info".to_string(),
         serde_json::Value::from(row.particle_info.clone()),
     ));
+    pairs.push(("information".to_string(), object(information)));
     pairs.push((
         "tail".to_string(),
         object(
@@ -240,7 +244,7 @@ pub struct FluxMode {
     is_busy: bool,
     progress_value: f64,
     header_check_status: String,
-    header_info: String,
+    header_info_text: String,
     start_time_text: String,
     stop_time_text: String,
     duration_text: String,
@@ -249,7 +253,6 @@ pub struct FluxMode {
     time_range_max: f64,
     is_log_scale: bool,
     /// Free-text test-condition metadata (not applied to any filtering
-    /// logic - the original only ever echoes these into the header info
     /// readout, see `FluxViewModel.DataProcessing.cs`'s `ProcessHeaderInternal`).
     delay_time: i32,
     threshold: i32,
@@ -286,7 +289,7 @@ impl Default for FluxMode {
             is_busy: false,
             progress_value: 0.0,
             header_check_status: String::new(),
-            header_info: String::new(),
+            header_info_text: String::new(),
             start_time_text: "-".to_string(),
             stop_time_text: "-".to_string(),
             duration_text: "-".to_string(),
@@ -330,13 +333,23 @@ impl FluxMode {
                     .add_enabled(!self.is_busy, egui::Button::new("Check Header"))
                     .clicked()
                 {
-                    self.header_check();
+                    self.check_header();
                 }
             });
             ui.horizontal(|ui| {
                 ui.label("Output File Name:");
                 ui.text_edit_singleline(&mut self.output_file_name);
             });
+
+            if !self.header_check_status.is_empty() {
+                ui.collapsing("Header Info", |ui| {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&self.header_check_status).monospace())
+                            .wrap(),
+                    );
+                });
+            }
+        
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(
@@ -388,12 +401,6 @@ impl FluxMode {
                 "Start: {}  Stop: {}  Duration: {}",
                 self.start_time_text, self.stop_time_text, self.duration_text
             ));
-            if !self.header_check_status.is_empty() {
-                ui.label(&self.header_check_status);
-            }
-            if !self.header_info.is_empty() {
-                ui.collapsing("Header Info", |ui| ui.monospace(&self.header_info));
-            }
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -473,7 +480,7 @@ impl FluxMode {
                 WorkerMsg::InputFilesInfo(s) => self.input_files_info = s,
                 WorkerMsg::OutputFileName(s) => self.output_file_name = s,
                 WorkerMsg::HeaderCheck(s) => self.header_check_status = s,
-                WorkerMsg::HeaderInfo(s) => self.header_info = s,
+                WorkerMsg::HeaderInfo(s) => self.header_info_text = s,
                 WorkerMsg::Timing {
                     start,
                     stop,
@@ -505,7 +512,7 @@ impl FluxMode {
         self.stop_time_text = "-".to_string();
         self.duration_text = "-".to_string();
         self.data_count = 0;
-        self.header_info.clear();
+        self.header_info_text.clear();
         self.accumulator = FluxAccumulator::default();
         self.rows.clear();
         self.json_preview.clear();
@@ -572,12 +579,17 @@ impl FluxMode {
         std::thread::spawn(move || read_data_worker(files, delay_time, threshold, tx));
     }
 
-    fn header_check(&mut self) {
+    fn check_header(&mut self) {
+        let Some(file_path) = self.selected_files.first().cloned() else {
+            self.status_message = "Please select files first.".to_string();
+            return;
+        };
         self.is_busy = true;
-        self.header_check_status = "Checking...".to_string();
-        let output_name = self.output_file_name.clone();
+        self.header_check_status = "Analyzing File Structure (Head & Tail)...".to_string();
+        let delay_time = self.delay_time;
+        let threshold = self.threshold;
         let tx = self.tx.clone();
-        std::thread::spawn(move || header_check_worker(output_name, tx));
+        std::thread::spawn(move || check_header_worker(file_path, delay_time, threshold, tx));
     }
 
     /// Data Table tab: one row per raw line, decoded per `flux.md`.
@@ -723,6 +735,8 @@ fn process_data_worker(files: Vec<PathBuf>, output_name: String, tx: Sender<Work
 /// filters E225 segments, then decodes each into the accumulator + a `FluxRow`
 /// that feeds the Data Table and JSON tabs.
 fn read_data_worker(files: Vec<PathBuf>, delay_time: i32, threshold: i32, tx: Sender<WorkerMsg>) {
+    let start = chrono::Local::now();
+
     let rows = match io::segment_filter::filter_e225_segments_from_files(
         &files,
         AppConstants::SEGMENT_HEX_LENGTH,
@@ -748,20 +762,10 @@ fn read_data_worker(files: Vec<PathBuf>, delay_time: i32, threshold: i32, tx: Se
     let _ = tx.send(WorkerMsg::DataCount(total_steps));
 
     let mut accumulator = FluxAccumulator::default();
-    let mut start_time = None;
     let mut last_hex: Option<&String> = None;
     let mut table_rows: Vec<FluxRow> = Vec::with_capacity(total_steps);
 
     for (i, hex_string) in rows.iter().enumerate() {
-        if i == 0 {
-            let dt = baseline_core::flux::processing::get_date_time_from_hex(hex_string);
-            start_time = Some(dt);
-            let _ = tx.send(WorkerMsg::Timing {
-                start: dt.format("%Y-%b-%d %H:%M:%S%.3f").to_string(),
-                stop: "-".to_string(),
-                duration: "-".to_string(),
-            });
-        }
         accumulator.process_flux_observation(hex_string);
         let hex_data = split_hex_data(hex_string);
         if let Some(line) = parse_flux_line(&hex_data) {
@@ -779,16 +783,13 @@ fn read_data_worker(files: Vec<PathBuf>, delay_time: i32, threshold: i32, tx: Se
         }
     }
 
-    let stop_time = last_hex.map(|h| baseline_core::flux::processing::get_date_time_from_hex(h));
-
-    if let (Some(start), Some(stop)) = (start_time, stop_time) {
-        let duration = stop.signed_duration_since(start);
-        let _ = tx.send(WorkerMsg::Timing {
-            start: start.format("%Y-%b-%d %H:%M:%S%.3f").to_string(),
-            stop: stop.format("%Y-%b-%d %H:%M:%S%.3f").to_string(),
-            duration: format!("{:.3} seconds", duration.num_milliseconds() as f64 / 1000.0),
-        });
-    }
+    let stop = chrono::Local::now();
+    let duration = stop.signed_duration_since(start);
+    let _ = tx.send(WorkerMsg::Timing {
+        start: start.format("%H:%M:%S").to_string(),
+        stop: stop.format("%H:%M:%S").to_string(),
+        duration: format!("{} ms", duration.num_milliseconds()),
+    });
 
     if let Some(hex) = last_hex {
         let hex_data = baseline_core::observation::data_processor::split_hex_data(hex);
@@ -838,29 +839,13 @@ fn read_data_worker(files: Vec<PathBuf>, delay_time: i32, threshold: i32, tx: Se
     let _ = tx.send(WorkerMsg::Busy(false));
 }
 
-fn header_check_worker(output_name: String, tx: Sender<WorkerMsg>) {
-    let Some(file_path) = io::file_helper::find_excel_file(&output_name, "Flux") else {
-        let _ = tx.send(WorkerMsg::Error(format!(
-            "File not found: {output_name}.xlsx (searched Documents/DSSD_Analysis/Flux and legacy locations)"
-        )));
-        let _ = tx.send(WorkerMsg::Busy(false));
-        return;
-    };
-
-    match io::excel::read_excel_column_a(&file_path) {
-        Ok(rows) => {
-            let mut result = "Header is correct!".to_string();
-            for (i, hex) in rows.iter().enumerate() {
-                if !hex.starts_with(AppConstants::HEADER_START) {
-                    result = format!("Header is INCORRECT! at data row no. {}", i + 1);
-                    break;
-                }
-            }
-            let _ = tx.send(WorkerMsg::HeaderCheck(result));
-        }
-        Err(e) => {
-            let _ = tx.send(WorkerMsg::Error(format!("Error reading file: {e}")));
-        }
-    }
+fn check_header_worker(file_path: PathBuf, delay_time: i32, threshold: i32, tx: Sender<WorkerMsg>) {
+    let text = io::header_check::check_header_summary(&file_path, delay_time, threshold as f64)
+        .unwrap_or_else(|e| format!("Error: {e}"));
+    let _ = tx.send(WorkerMsg::HeaderCheck(text));
+    let _ = tx.send(WorkerMsg::Status(
+        "Header Analysis Complete.".to_string(),
+        Color32::GRAY,
+    ));
     let _ = tx.send(WorkerMsg::Busy(false));
 }

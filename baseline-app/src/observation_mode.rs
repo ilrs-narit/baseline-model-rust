@@ -324,6 +324,12 @@ enum WorkerMsg {
         raw_histogram_data: HashMap<String, Vec<i32>>,
         events: Vec<EventRow>,
     },
+    Timing {
+        run_id: u64,
+        start: String,
+        stop: String,
+        duration: String,
+    },
     Error {
         run_id: u64,
         text: String,
@@ -338,6 +344,9 @@ pub struct ObservationMode {
     is_busy: bool,
     progress_value: f64,
     data_count_str: String,
+    start_time_str: String,
+    stop_time_str: String,
+    duration_str: String,
 
     active_tab: ObservationTab,
     view_mode: ObservationViewMode,
@@ -385,6 +394,9 @@ impl Default for ObservationMode {
             is_busy: false,
             progress_value: 0.0,
             data_count_str: "-".to_string(),
+            start_time_str: "-".to_string(),
+            stop_time_str: "-".to_string(),
+            duration_str: "-".to_string(),
             active_tab: ObservationTab::GraphView,
             view_mode: ObservationViewMode::DssdPulseHeight,
             selected_layer: DetectorLayer::L1,
@@ -569,6 +581,13 @@ impl ObservationMode {
                 );
             }
             ui.label(format!("Data count: {}", self.data_count_str));
+            ui.add(
+                egui::Label::new(format!(
+                    "Start: {}  Stop: {}  Duration: {}",
+                    self.start_time_str, self.stop_time_str, self.duration_str
+                ))
+                .wrap(),
+            );
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1162,6 +1181,16 @@ impl ObservationMode {
                     self.status_message = "Processing complete!".to_string();
                     self.is_busy = false;
                 }
+                WorkerMsg::Timing {
+                    run_id,
+                    start,
+                    stop,
+                    duration,
+                } if run_id == self.run_id => {
+                    self.start_time_str = start;
+                    self.stop_time_str = stop;
+                    self.duration_str = duration;
+                }
                 WorkerMsg::Error { run_id, text } if run_id == self.run_id => {
                     self.status_message = text;
                     self.is_busy = false;
@@ -1181,6 +1210,9 @@ impl ObservationMode {
         self.json_preview.clear();
         self.fit_cache.clear();
         self.data_count_str = "-".to_string();
+        self.start_time_str = "-".to_string();
+        self.stop_time_str = "-".to_string();
+        self.duration_str = "-".to_string();
         self.status_message = "Ready".to_string();
         self.progress_value = 0.0;
         self.is_busy = false;
@@ -1204,6 +1236,9 @@ impl ObservationMode {
         self.json_preview.clear();
         self.fit_cache.clear();
         self.data_count_str = "-".to_string();
+        self.start_time_str = "-".to_string();
+        self.stop_time_str = "-".to_string();
+        self.duration_str = "-".to_string();
         self.progress_value = 0.0;
         let message = match files.len() {
             1 => "1 file selected.".to_string(),
@@ -1225,6 +1260,9 @@ impl ObservationMode {
         self.json_preview.clear();
         self.fit_cache.clear();
         self.data_count_str = "-".to_string();
+        self.start_time_str = "-".to_string();
+        self.stop_time_str = "-".to_string();
+        self.duration_str = "-".to_string();
 
         let files = self.input_files.clone();
         let tx = self.tx.clone();
@@ -1744,6 +1782,7 @@ fn fit_observation_single_left_hemg(x_data: &[f64], y_data: &[f64]) -> Option<Ob
 }
 
 fn analyze_files_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>, run_id: u64) {
+    let start = chrono::Local::now();
     let mut processor = ObservationDataProcessor::new();
     let _ = tx.send(WorkerMsg::Status {
         run_id,
@@ -1792,6 +1831,15 @@ fn analyze_files_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>, run_id: u64)
                 histogram_data,
                 raw_histogram_data,
                 events,
+            });
+
+            let stop = chrono::Local::now();
+            let duration = stop.signed_duration_since(start);
+            let _ = tx.send(WorkerMsg::Timing {
+                run_id,
+                start: start.format("%H:%M:%S").to_string(),
+                stop: stop.format("%H:%M:%S").to_string(),
+                duration: format!("{} ms", duration.num_milliseconds()),
             });
         }
         Err(e) => {
