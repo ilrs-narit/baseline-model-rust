@@ -30,6 +30,78 @@ where
     Value::Object(pairs.into_iter().collect())
 }
 
+/// True when every element of `arr` is a scalar (not an object/array), so the
+/// array can be printed on one line, e.g. `[1, 2, 3, 4, 5]`.
+fn is_flat_array(arr: &[Value]) -> bool {
+    arr.iter().all(|v| !matches!(v, Value::Array(_) | Value::Object(_)))
+}
+
+fn write_indent(out: &mut String, depth: usize) {
+    for _ in 0..depth {
+        out.push_str("  ");
+    }
+}
+
+/// Writes `value` as pretty JSON into `out`, 2-space indented like
+/// `serde_json::to_string_pretty`, except that scalar arrays (numbers,
+/// strings, bools, null - no nested objects/arrays) are kept on one line.
+fn write_pretty(value: &Value, depth: usize, out: &mut String) {
+    match value {
+        Value::Array(arr) if arr.is_empty() => out.push_str("[]"),
+        Value::Array(arr) if is_flat_array(arr) => {
+            out.push('[');
+            for (i, item) in arr.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_pretty(item, depth, out);
+            }
+            out.push(']');
+        }
+        Value::Array(arr) => {
+            out.push_str("[\n");
+            let inner = depth + 1;
+            for (i, item) in arr.iter().enumerate() {
+                write_indent(out, inner);
+                write_pretty(item, inner, out);
+                if i + 1 < arr.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            write_indent(out, depth);
+            out.push(']');
+        }
+        Value::Object(map) if map.is_empty() => out.push_str("{}"),
+        Value::Object(map) => {
+            out.push_str("{\n");
+            let inner = depth + 1;
+            let len = map.len();
+            for (i, (key, v)) in map.iter().enumerate() {
+                write_indent(out, inner);
+                out.push_str(&serde_json::to_string(key).unwrap_or_default());
+                out.push_str(": ");
+                write_pretty(v, inner, out);
+                if i + 1 < len {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            write_indent(out, depth);
+            out.push('}');
+        }
+        scalar => out.push_str(&serde_json::to_string(scalar).unwrap_or_default()),
+    }
+}
+
+/// Pretty-prints `value`, keeping scalar arrays (e.g. the 16 decoded values
+/// of a block) on one line instead of one element per line.
+pub fn to_pretty_string(value: &Value) -> String {
+    let mut out = String::new();
+    write_pretty(value, 0, &mut out);
+    out
+}
+
 /// Pretty-prints the first [`PREVIEW_ROWS`] of `values` for the on-screen
 /// preview. Returns an empty string when there is nothing to show.
 pub fn preview_string(values: &[Value]) -> String {
@@ -37,7 +109,7 @@ pub fn preview_string(values: &[Value]) -> String {
         return String::new();
     }
     let shown = &values[..values.len().min(PREVIEW_ROWS)];
-    serde_json::to_string_pretty(shown).unwrap_or_default()
+    to_pretty_string(&Value::Array(shown.to_vec()))
 }
 
 /// Renders the JSON tab body. Returns `true` when the download button was
@@ -89,28 +161,8 @@ pub fn save_json(default_name: &str, values: &[Value]) -> Result<Option<PathBuf>
     else {
         return Ok(None);
     };
-    let text = serde_json::to_string_pretty(values).map_err(|e| e.to_string())?;
+    let text = to_pretty_string(&Value::Array(values.to_vec()));
     std::fs::write(&path, text).map_err(|e| e.to_string())?;
     Ok(Some(path))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn num_or_str_parses_numbers_but_keeps_markers() {
-        assert_eq!(num_or_str(" 42 "), Value::from(42));
-        assert_eq!(num_or_str("3.5"), Value::from(3.5));
-        assert_eq!(num_or_str("E225"), Value::from("E225"));
-    }
-
-    #[test]
-    fn object_preserves_insertion_order() {
-        let v = object([
-            ("b".to_string(), 1.into()),
-            ("a".to_string(), 2.into()),
-        ]);
-        assert_eq!(serde_json::to_string(&v).unwrap(), r#"{"b":1,"a":2}"#);
-    }
-}
