@@ -149,21 +149,21 @@ fn csv_field(value: &str) -> String {
     }
 }
 
-/// Tail keys for the JSON view
+/// Housekeeping `dssdfee` keys for the JSON view
 const CALIBRATION_JSON_TAIL_KEYS: [&str; 10] = [
-    "dssd1_temperature",
-    "fee1_current",
-    "fee1_temperature",
-    "dssd7_temperature",
-    "fee2_current",
-    "fee2_temperature",
-    "fee1_threshold",
-    "fee2_threshold",
-    "dssd1_temperature_dup",
-    "dssd4_temperature",
+    "dssd1Temperatures",
+    "fee1Current",
+    "fee1Temperature",
+    "dssd7Temperature",
+    "fee2Current",
+    "fee2Temperature",
+    "fee1Threshold",
+    "fee2Threshold",
+    "dssd1TemperatureDup",
+    "dssd4Temperature",
 ];
 
-/// Number of voltage steps in the calibration payload (`00v`..`10v`).
+/// Number of voltage steps in the calibration payload (`00V`..`10V`).
 const CALIBRATION_VOLTAGE_STEPS: usize = 11;
 
 /// One Data Table row as a JSON object
@@ -173,7 +173,7 @@ fn calibration_row_json(row: &CalibrationRow) -> serde_json::Value {
     let steps = object((0..CALIBRATION_VOLTAGE_STEPS).map(|step| {
         let base = step * 4;
         let layers = object(
-            ["l1", "l2", "l6", "l7"]
+            ["L1", "L2", "L6", "L7"]
                 .iter()
                 .enumerate()
                 .map(|(i, name)| {
@@ -185,9 +185,9 @@ fn calibration_row_json(row: &CalibrationRow) -> serde_json::Value {
                     (name.to_string(), list)
                 }),
         );
-        (format!("{step:02}v"), layers)
+        (format!("{step:02}V"), layers)
     }));
-    let tail = object(
+    let dssdfee = object(
         CALIBRATION_JSON_TAIL_KEYS
             .iter()
             .zip(&row.tail)
@@ -198,17 +198,25 @@ fn calibration_row_json(row: &CalibrationRow) -> serde_json::Value {
         (
             "header".to_string(),
             object([
-                ("packet_sync_code".to_string(), num_or_str(&row.packet_sync)),
-                ("packet_id".to_string(), row.package_id.into()),
-                ("pakcet_seq".to_string(), row.packet_sequence.into()),
-                ("packet_data_len".to_string(), row.packet_data_length.into()),
+                ("packetSyncCode".to_string(), num_or_str(&row.packet_sync)),
+                ("packetID".to_string(), row.package_id.into()),
+                ("packetSeq".to_string(), row.packet_sequence.into()),
+                ("packetDataLen".to_string(), row.packet_data_length.into()),
                 ("time".to_string(), format_event_time(row.time).into()),
-                ("data_type".to_string(), row.data_type.clone().into()),
-                ("sample_index".to_string(), row.sample_index.into()),
+                ("dataType".to_string(), row.data_type.clone().into()),
             ]),
         ),
-        ("calibration_voltage_step".to_string(), steps),
-        ("tail".to_string(), tail),
+        (
+            "data".to_string(),
+            object([
+                ("sampleIndex".to_string(), row.sample_index.into()),
+                ("voltageStep".to_string(), steps),
+            ]),
+        ),
+        (
+            "housekeeping".to_string(),
+            object([("dssdfee".to_string(), dssdfee)]),
+        ),
         ("reserved".to_string(), row.reserved_hex.clone().into()),
         ("checksum".to_string(), row.checksum_hex.clone().into()),
     ])

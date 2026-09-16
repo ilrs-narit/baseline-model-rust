@@ -155,61 +155,59 @@ fn csv_field(value: &str) -> String {
     }
 }
 
-/// Tail keys for the JSON view
+/// Housekeeping keys for the JSON view: `dssdfee` (first 8) then `BGO` (last 4)
 const FLUX_JSON_TAIL_KEYS: [&str; 12] = [
-    "dssd_1_temperature",
-    "fee1_current",
-    "fee1_temperature",
-    "dssd_7_temperature",
-    "fee2_current",
-    "fee2_temperature",
-    "fee1_threshold",
-    "fee2_threshold",
-    "bgo1_bias_voltage",
-    "bgo2_bias_voltage",
-    "bgo3_bias_voltage",
-    "bgo2_temperature",
+    "dssd1Temperatures",
+    "fee1Current",
+    "fee1Temperature",
+    "dssd7Temperature",
+    "fee2Current",
+    "fee2Temperature",
+    "fee1Threshold",
+    "fee2Threshold",
+    "bgo1BiasVoltage",
+    "bgo2BiasVoltage",
+    "bgo3BiasVoltage",
+    "bgo2Temperature",
 ];
 
 /// One Data Table row as a JSON object
 fn flux_row_json(row: &FluxRow) -> serde_json::Value {
     use crate::json_view::{num_or_str, object};
 
-    let mut pairs: Vec<(String, serde_json::Value)> = vec![(
-        "header".to_string(),
-        object([
-            ("packet_sync_code".to_string(), num_or_str(&row.packet_sync)),
-            ("packet_id".to_string(), row.package_id.into()),
-            ("pakcet_seq".to_string(), row.packet_sequence.into()),
-            ("packet_data_len".to_string(), row.packet_data_length.into()),
-            ("time".to_string(), format_event_time(row.time).into()),
-            ("data_type".to_string(), row.data_type.clone().into()),
-            ("particle_time".to_string(), row.particle_time.into()),
-        ]),
-    )];
-    let mut information: Vec<(String, serde_json::Value)> = row
-        .particle_counts
-        .iter()
-        .enumerate()
-        .map(|(i, count)| (format!("particle_counts_l{}", i + 1), (*count).into()))
-        .collect();
-    information.push((
-        "particle_info".to_string(),
-        serde_json::Value::from(row.particle_info.clone()),
-    ));
-    pairs.push(("information".to_string(), object(information)));
-    pairs.push((
-        "tail".to_string(),
-        object(
-            FLUX_JSON_TAIL_KEYS
-                .iter()
-                .zip(&row.tail)
-                .map(|(k, v)| (k.to_string(), num_or_str(v))),
-        ),
-    ));
-    pairs.push(("reserved".to_string(), row.reserved_hex.clone().into()));
-    pairs.push(("checksum".to_string(), row.checksum_hex.clone().into()));
-    object(pairs)
+    let header = object([
+        ("packetSyncCode".to_string(), num_or_str(&row.packet_sync)),
+        ("packetID".to_string(), row.package_id.into()),
+        ("packetSeq".to_string(), row.packet_sequence.into()),
+        ("packetDataLen".to_string(), row.packet_data_length.into()),
+        ("time".to_string(), format_event_time(row.time).into()),
+        ("dataType".to_string(), row.data_type.clone().into()),
+    ]);
+
+    let particle_counts = object(
+        row.particle_counts
+            .iter()
+            .enumerate()
+            .map(|(i, count)| (format!("L{}", i + 1), (*count).into())),
+    );
+    let data = object([
+        ("particleTime".to_string(), row.particle_time.into()),
+        ("particleCounts".to_string(), particle_counts),
+        ("particleInfo".to_string(), serde_json::Value::from(row.particle_info.clone())),
+    ]);
+
+    let mut tail_values = FLUX_JSON_TAIL_KEYS.iter().zip(&row.tail).map(|(k, v)| (k.to_string(), num_or_str(v)));
+    let dssdfee = object((&mut tail_values).take(8));
+    let bgo = object(tail_values);
+    let housekeeping = object([("dssdfee".to_string(), dssdfee), ("BGO".to_string(), bgo)]);
+
+    object([
+        ("header".to_string(), header),
+        ("data".to_string(), data),
+        ("housekeeping".to_string(), housekeeping),
+        ("reserved".to_string(), row.reserved_hex.clone().into()),
+        ("checksum".to_string(), row.checksum_hex.clone().into()),
+    ])
 }
 
 fn flux_rows_json(rows: &[FluxRow]) -> Vec<serde_json::Value> {

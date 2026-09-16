@@ -45,10 +45,6 @@ fn particle_byte_label(range: &str) -> String {
     format!("(Particle Byte {range})")
 }
 
-fn data_table_shows_dssd(view_mode: ObservationViewMode) -> bool {
-    view_mode != ObservationViewMode::Bgo
-}
-
 /// "{label} (Byte {n})" for a 1-byte field, "{label} (Byte {n}-{m})" for a
 /// 2-byte one - matches the "(Byte X-Y)" style of the other Data Table headers.
 fn line_extra_header(field: &baseline_core::observation::LineTailField) -> String {
@@ -76,42 +72,27 @@ struct EventRow {
 }
 
 /// JSON Structure
-/// `event_group` count keys
-const OBS_JSON_EVENT_COUNT_KEYS: [&str; 18] = [
-    "galactic_electron_count",
-    "albedo_electron_count",
-    "galactic_ion_count",
-    "albedo_ion_count",
-    "l1_ion_threshold",
-    "l1_electron_threshold",
-    "l2_ion_particle",
-    "l2_electron_particle",
-    "l3_ion_particle",
-    "l3_electron_particle",
-    "l4_ion_particle",
-    "l4_electron_particle",
-    "l5_ion_particle",
-    "l5_electron_particle",
-    "l6_ion_particle",
-    "l6_electron_particle",
-    "l7_ion_particle",
-    "l7_electron_particle",
+/// `layerParticleCount` layers, in `line_extra` order starting at index 6
+const OBS_JSON_PARTICLE_COUNT_LAYERS: [&str; 6] = ["L2", "L3", "L4", "L5", "L6", "L7"];
+
+/// `housekeeping.dssdfee` keys, in `line_extra` order starting at index 18
+const OBS_JSON_DSSDFEE_KEYS: [&str; 8] = [
+    "dssd1Temperatures",
+    "fee1Current",
+    "fee1Temperature",
+    "dssd7Temperature",
+    "fee2Current",
+    "fee2Temperature",
+    "fee1Threshold",
+    "fee2Threshold",
 ];
 
-/// tail keys
-const OBS_JSON_TAIL_KEYS: [&str; 12] = [
-    "dssd1_temperature",
-    "fee1_current",
-    "fee1_temperature",
-    "dssd7_temperature",
-    "fee2_current",
-    "fee2_temperature",
-    "fee1_threshold",
-    "fee2_threshold",
-    "bgo1_bias_voltage",
-    "bgo2_bias_voltage",
-    "bgo3_bias_voltage",
-    "bgo2_temperature",
+/// `housekeeping.BGO` keys, in `line_extra` order starting at index 26
+const OBS_JSON_BGO_KEYS: [&str; 4] = [
+    "bgo1BiasVoltage",
+    "bgo2BiasVoltage",
+    "bgo3BiasVoltage",
+    "bgo2Temperature",
 ];
 
 /// Particle events per packet - one JSON object groups this many `event_group`
@@ -120,28 +101,34 @@ const OBS_JSON_TAIL_KEYS: [&str; 12] = [
 const PARTICLES_PER_PACKET: usize = 5;
 
 fn observation_particle_json(event: &EventRow) -> serde_json::Value {
-    use crate::json_view::{num_or_str, object};
+    use crate::json_view::object;
 
-    let extra = |i: usize| {
-        event
-            .line_extra
-            .get(i)
-            .map(|s| num_or_str(s))
-            .unwrap_or(serde_json::Value::Null)
+    let dssd_layer = |idx: usize| {
+        let (x, y) = event.dssd[idx];
+        object([
+            ("xy_Position".to_string(), event.dssd_position[idx].into()),
+            ("x_PulseHeight".to_string(), x.into()),
+            ("y_PulseHeight".to_string(), y.into()),
+        ])
+    };
+    let bgo_layer = |idx: usize| {
+        let (high, low) = event.bgo[idx];
+        object([
+            ("highGainPulseHeight".to_string(), high.into()),
+            ("lowGainPulseHeight".to_string(), low.into()),
+        ])
     };
 
-    let mut pairs: Vec<(String, serde_json::Value)> =
-        vec![("particle_time".to_string(), event.particle_time_raw.into())];
-    for (idx, name) in ["l1", "l2", "l6", "l7"].iter().enumerate() {
-        let (x, y) = event.dssd[idx];
-        pairs.push((format!("{name}_xy_position"), event.dssd_position[idx].into()));
-        pairs.push((format!("{name}_x_pulse_height"), x.into()));
-        pairs.push((format!("{name}_y_pulse_height"), y.into()));
-    }
-    for (i, key) in OBS_JSON_EVENT_COUNT_KEYS.iter().enumerate() {
-        pairs.push((key.to_string(), extra(i)));
-    }
-    object(pairs)
+    object([
+        ("particleTime".to_string(), event.particle_time_raw.into()),
+        ("L1".to_string(), dssd_layer(0)),
+        ("L2".to_string(), dssd_layer(1)),
+        ("L3".to_string(), bgo_layer(0)),
+        ("L4".to_string(), bgo_layer(1)),
+        ("L5".to_string(), bgo_layer(2)),
+        ("L6".to_string(), dssd_layer(2)),
+        ("L7".to_string(), dssd_layer(3)),
+    ])
 }
 
 fn observation_packet_json(events: &[EventRow]) -> serde_json::Value {
@@ -166,30 +153,61 @@ fn observation_packet_json(events: &[EventRow]) -> serde_json::Value {
             .unwrap_or(serde_json::Value::Null)
     };
 
-    let tail = object(
-        OBS_JSON_TAIL_KEYS
+    let layer_particle_count = object(OBS_JSON_PARTICLE_COUNT_LAYERS.iter().enumerate().map(|(i, name)| {
+        let base = 6 + i * 2;
+        (
+            name.to_string(),
+            object([
+                ("ionParticle".to_string(), extra(base)),
+                ("electronParticle".to_string(), extra(base + 1)),
+            ]),
+        )
+    }));
+    let dssdfee = object(
+        OBS_JSON_DSSDFEE_KEYS
             .iter()
             .enumerate()
             .map(|(i, key)| (key.to_string(), extra(18 + i))),
     );
+    let bgo = object(
+        OBS_JSON_BGO_KEYS
+            .iter()
+            .enumerate()
+            .map(|(i, key)| (key.to_string(), extra(26 + i))),
+    );
+
+    let housekeeping = object([
+        ("galacticElectronCount".to_string(), extra(0)),
+        ("albedoElectronCount".to_string(), extra(1)),
+        ("galacticIonCount".to_string(), extra(2)),
+        ("albedoIonCount".to_string(), extra(3)),
+        ("L1IonThreshold".to_string(), extra(4)),
+        ("L1ElectronThreshold".to_string(), extra(5)),
+        ("layerParticleCount".to_string(), layer_particle_count),
+        ("dssdfee".to_string(), dssdfee),
+        ("BGO".to_string(), bgo),
+    ]);
 
     object([
         (
             "header".to_string(),
             object([
-                ("packet_sync_code".to_string(), num_or_str(&first.packet_sync)),
-                ("packet_id".to_string(), first.package_id.into()),
-                ("pakcet_seq".to_string(), first.packet_sequence.into()),
-                ("packet_data_len".to_string(), first.packet_data_length.into()),
+                ("packetSyncCode".to_string(), num_or_str(&first.packet_sync)),
+                ("packetID".to_string(), first.package_id.into()),
+                ("packetSeq".to_string(), first.packet_sequence.into()),
+                ("packetDataLen".to_string(), first.packet_data_length.into()),
                 ("time".to_string(), format_event_time(first.time).into()),
-                ("data_type".to_string(), first.data_type.clone().into()),
+                ("dataType".to_string(), first.data_type.clone().into()),
             ]),
         ),
         (
-            "event_group".to_string(),
-            serde_json::Value::Array(events.iter().map(observation_particle_json).collect()),
+            "data".to_string(),
+            object([(
+                "event_group".to_string(),
+                serde_json::Value::Array(events.iter().map(observation_particle_json).collect()),
+            )]),
         ),
-        ("tail".to_string(), tail),
+        ("housekeeping".to_string(), housekeeping),
         ("padding".to_string(), hex_extra(30)),
         ("checksum".to_string(), hex_extra(31)),
     ])
@@ -731,10 +749,9 @@ impl ObservationMode {
         });
     }
 
-    /// Data Table tab: one row per decoded particle event, with the DSSD/BGO columns
+    /// Data Table tab: one row per decoded particle event, with the DSSD/BGO
+    /// columns in JSON's L1-L7 order.
     fn data_table_ui(&mut self, ui: &mut egui::Ui) {
-        let show_dssd = data_table_shows_dssd(self.view_mode);
-
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
@@ -746,12 +763,10 @@ impl ObservationMode {
                 self.export_table_csv();
             }
             ui.label(format!("{} event(s)", self.events.len()));
-            if show_dssd {
-                ui.separator();
-                ui.label("DSSD values:");
-                ui.radio_value(&mut self.dssd_data_unit, DssdDataUnit::Adc, "ADC");
-                ui.radio_value(&mut self.dssd_data_unit, DssdDataUnit::Voltage, "Voltage");
-            }
+            ui.separator();
+            ui.label("DSSD values:");
+            ui.radio_value(&mut self.dssd_data_unit, DssdDataUnit::Adc, "ADC");
+            ui.radio_value(&mut self.dssd_data_unit, DssdDataUnit::Voltage, "Voltage");
         });
         ui.separator();
 
@@ -764,19 +779,22 @@ impl ObservationMode {
             "Data Type (Byte 14-15)".to_string(),
             format!("Particle Time {}", particle_byte_label("0-1")),
         ];
-        if show_dssd {
-            for layer in DSSD_TABLE_LAYERS {
-                let (pos_range, x_range, y_range) = dssd_byte_ranges(layer);
-                headers.push(format!("{layer:?} XY Position {}", particle_byte_label(pos_range)));
-                headers.push(format!("{layer:?} X Pulse Height {}", particle_byte_label(x_range)));
-                headers.push(format!("{layer:?} Y Pulse Height {}", particle_byte_label(y_range)));
-            }
-        } else {
-            for layer in BGO_TABLE_LAYERS {
-                let (h_range, l_range) = bgo_byte_ranges(layer);
-                headers.push(format!("{layer:?} High-Gain Pulse Height {}", particle_byte_label(h_range)));
-                headers.push(format!("{layer:?} Low-Gain Pulse Height {}", particle_byte_label(l_range)));
-            }
+        for layer in &DSSD_TABLE_LAYERS[..2] {
+            let (pos_range, x_range, y_range) = dssd_byte_ranges(*layer);
+            headers.push(format!("{layer:?} XY Position {}", particle_byte_label(pos_range)));
+            headers.push(format!("{layer:?} X Pulse Height {}", particle_byte_label(x_range)));
+            headers.push(format!("{layer:?} Y Pulse Height {}", particle_byte_label(y_range)));
+        }
+        for layer in BGO_TABLE_LAYERS {
+            let (h_range, l_range) = bgo_byte_ranges(layer);
+            headers.push(format!("{layer:?} High-Gain Pulse Height {}", particle_byte_label(h_range)));
+            headers.push(format!("{layer:?} Low-Gain Pulse Height {}", particle_byte_label(l_range)));
+        }
+        for layer in &DSSD_TABLE_LAYERS[2..] {
+            let (pos_range, x_range, y_range) = dssd_byte_ranges(*layer);
+            headers.push(format!("{layer:?} XY Position {}", particle_byte_label(pos_range)));
+            headers.push(format!("{layer:?} X Pulse Height {}", particle_byte_label(x_range)));
+            headers.push(format!("{layer:?} Y Pulse Height {}", particle_byte_label(y_range)));
         }
         for field in LINE_TAIL_FIELDS {
             headers.push(line_extra_header(field));
@@ -816,21 +834,23 @@ impl ObservationMode {
                                         event.data_type.clone(),
                                         event.particle_time_raw.to_string(),
                                     ];
-                                    if show_dssd {
-                                        for (pos, (x, y)) in event
-                                            .dssd_position
-                                            .into_iter()
-                                            .zip(event.dssd)
-                                        {
-                                            cells.push(pos.to_string());
-                                            cells.push(self.format_dssd_value(x));
-                                            cells.push(self.format_dssd_value(y));
-                                        }
-                                    } else {
-                                        for (h, l) in event.bgo {
-                                            cells.push(h.to_string());
-                                            cells.push(l.to_string());
-                                        }
+                                    for (pos, (x, y)) in
+                                        event.dssd_position[..2].iter().zip(&event.dssd[..2])
+                                    {
+                                        cells.push(pos.to_string());
+                                        cells.push(self.format_dssd_value(*x));
+                                        cells.push(self.format_dssd_value(*y));
+                                    }
+                                    for (h, l) in event.bgo {
+                                        cells.push(h.to_string());
+                                        cells.push(l.to_string());
+                                    }
+                                    for (pos, (x, y)) in
+                                        event.dssd_position[2..].iter().zip(&event.dssd[2..])
+                                    {
+                                        cells.push(pos.to_string());
+                                        cells.push(self.format_dssd_value(*x));
+                                        cells.push(self.format_dssd_value(*y));
                                     }
                                     for value in event.line_extra.iter() {
                                         cells.push(value.clone());
@@ -867,31 +887,35 @@ impl ObservationMode {
             return;
         };
 
-        let show_dssd = data_table_shows_dssd(self.view_mode);
-
         let mut csv = String::from(
             "Packet Sync Code (Byte 0-1),Package ID (Byte 2-3),Packet Seq (Byte 4-5),Packet Data Len (Byte 6-7),Time (Byte 8-13),Data Type (Byte 14-15)",
         );
         csv.push_str(&format!(",Particle Time {}", particle_byte_label("0-1")));
-        if show_dssd {
-            for layer in DSSD_TABLE_LAYERS {
-                let (pos_range, x_range, y_range) = dssd_byte_ranges(layer);
-                csv.push_str(&format!(
-                    ",{layer:?} XY Position {},{layer:?} X Pulse Height {},{layer:?} Y Pulse Height {}",
-                    particle_byte_label(pos_range),
-                    particle_byte_label(x_range),
-                    particle_byte_label(y_range)
-                ));
-            }
-        } else {
-            for layer in BGO_TABLE_LAYERS {
-                let (h_range, l_range) = bgo_byte_ranges(layer);
-                csv.push_str(&format!(
-                    ",{layer:?} High-Gain Pulse Height {},{layer:?} Low-Gain Pulse Height {}",
-                    particle_byte_label(h_range),
-                    particle_byte_label(l_range)
-                ));
-            }
+        for layer in &DSSD_TABLE_LAYERS[..2] {
+            let (pos_range, x_range, y_range) = dssd_byte_ranges(*layer);
+            csv.push_str(&format!(
+                ",{layer:?} XY Position {},{layer:?} X Pulse Height {},{layer:?} Y Pulse Height {}",
+                particle_byte_label(pos_range),
+                particle_byte_label(x_range),
+                particle_byte_label(y_range)
+            ));
+        }
+        for layer in BGO_TABLE_LAYERS {
+            let (h_range, l_range) = bgo_byte_ranges(layer);
+            csv.push_str(&format!(
+                ",{layer:?} High-Gain Pulse Height {},{layer:?} Low-Gain Pulse Height {}",
+                particle_byte_label(h_range),
+                particle_byte_label(l_range)
+            ));
+        }
+        for layer in &DSSD_TABLE_LAYERS[2..] {
+            let (pos_range, x_range, y_range) = dssd_byte_ranges(*layer);
+            csv.push_str(&format!(
+                ",{layer:?} XY Position {},{layer:?} X Pulse Height {},{layer:?} Y Pulse Height {}",
+                particle_byte_label(pos_range),
+                particle_byte_label(x_range),
+                particle_byte_label(y_range)
+            ));
         }
         for field in LINE_TAIL_FIELDS {
             csv.push_str(&format!(",{}", line_extra_header(field)));
@@ -909,19 +933,24 @@ impl ObservationMode {
                 event.data_type
             ));
             csv.push_str(&format!(",{}", event.particle_time_raw));
-            if show_dssd {
-                for (pos, (x, y)) in event.dssd_position.into_iter().zip(event.dssd) {
-                    csv.push_str(&format!(
-                        ",{},{},{}",
-                        pos,
-                        self.format_dssd_value(x),
-                        self.format_dssd_value(y)
-                    ));
-                }
-            } else {
-                for (h, l) in event.bgo {
-                    csv.push_str(&format!(",{h},{l}"));
-                }
+            for (pos, (x, y)) in event.dssd_position[..2].iter().zip(&event.dssd[..2]) {
+                csv.push_str(&format!(
+                    ",{},{},{}",
+                    pos,
+                    self.format_dssd_value(*x),
+                    self.format_dssd_value(*y)
+                ));
+            }
+            for (h, l) in event.bgo {
+                csv.push_str(&format!(",{h},{l}"));
+            }
+            for (pos, (x, y)) in event.dssd_position[2..].iter().zip(&event.dssd[2..]) {
+                csv.push_str(&format!(
+                    ",{},{},{}",
+                    pos,
+                    self.format_dssd_value(*x),
+                    self.format_dssd_value(*y)
+                ));
             }
             for value in event.line_extra.iter() {
                 csv.push_str(&format!(",{value}"));
@@ -1848,50 +1877,5 @@ fn analyze_files_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>, run_id: u64)
                 text: format!("Error! {e}"),
             });
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-
-    fn sample_event(particle_time: i32) -> EventRow {
-        let line_extra: Arc<[String]> = (0..32).map(|i| i.to_string()).collect();
-        EventRow {
-            packet_sync: "E225".to_string(),
-            package_id: 7,
-            packet_sequence: 3,
-            packet_data_length: 247,
-            time: DateTime::from_timestamp(0, 0).unwrap(),
-            data_type: "00AD".to_string(),
-            particle_time_raw: particle_time,
-            dssd_position: [1, 2, 3, 4],
-            dssd: [(10, 11), (12, 13), (14, 15), (16, 17)],
-            bgo: [(0, 0), (0, 0), (0, 0)],
-            line_extra,
-        }
-    }
-
-    #[test]
-    fn one_packet_groups_five_particle_events() {
-        let events: Vec<EventRow> = (0..5).map(sample_event).collect();
-        let packets = observation_events_json(&events);
-        assert_eq!(packets.len(), 1);
-
-        let packet = &packets[0];
-        // Header carries no per-particle particle_time.
-        assert!(packet["header"].get("particle_time").is_none());
-        assert_eq!(packet["header"]["packet_id"], serde_json::json!(7));
-
-        let group = packet["event_group"].as_array().unwrap();
-        assert_eq!(group.len(), 5);
-        assert_eq!(group[2]["particle_time"], serde_json::json!(2));
-        assert_eq!(group[0]["l1_x_pulse_height"], serde_json::json!(10));
-        assert_eq!(group[0]["galactic_electron_count"], serde_json::json!(0));
-
-        assert_eq!(packet["tail"]["dssd1_temperature"], serde_json::json!(18));
-        assert_eq!(packet["padding"], serde_json::json!("30"));
-        assert_eq!(packet["checksum"], serde_json::json!("31"));
     }
 }

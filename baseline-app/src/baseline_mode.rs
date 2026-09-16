@@ -119,8 +119,14 @@ fn baseline_table_headers() -> Vec<String> {
         "Data Type (Byte 14-15)".to_string(),
         "Sample Index (Byte 16-17)".to_string(),
     ];
-    for (layer, offset) in [("L1", L1_OFFSET), ("L2", L2_OFFSET), ("L6", L6_OFFSET), ("L7", L7_OFFSET)] {
-        for i in 0..BLOCKS_PER_LAYER {
+    for i in 0..BLOCKS_PER_LAYER {
+        for (layer, offset) in [("L1", L1_OFFSET), ("L2", L2_OFFSET)] {
+            let (start, end) = block_byte_range(offset, i);
+            headers.push(format!("{layer} Data Acquisition-{} (Byte {start}-{end})", i + 1));
+        }
+    }
+    for i in 0..BLOCKS_PER_LAYER {
+        for (layer, offset) in [("L6", L6_OFFSET), ("L7", L7_OFFSET)] {
             let (start, end) = block_byte_range(offset, i);
             headers.push(format!("{layer} Data Acquisition-{} (Byte {start}-{end})", i + 1));
         }
@@ -150,8 +156,13 @@ fn baseline_row_cells(row: &BaselineRow) -> Vec<String> {
         row.data_type.clone(),
         row.sample_index.to_string(),
     ];
-    for blocks in [&row.l1_blocks, &row.l2_blocks, &row.l6_blocks, &row.l7_blocks] {
-        cells.extend(blocks.iter().map(|b| join_i32_values(b)));
+    for i in 0..row.l1_blocks.len() {
+        cells.push(join_i32_values(&row.l1_blocks[i]));
+        cells.push(join_i32_values(&row.l2_blocks[i]));
+    }
+    for i in 0..row.l6_blocks.len() {
+        cells.push(join_i32_values(&row.l6_blocks[i]));
+        cells.push(join_i32_values(&row.l7_blocks[i]));
     }
     cells.extend(row.tail.iter().cloned());
     cells.push(row.reserved_hex.clone());
@@ -169,33 +180,35 @@ fn csv_field(value: &str) -> String {
     }
 }
 
-/// Tail keys for the JSON view
+/// Housekeeping `dssdfee` keys for the JSON view
 const BASELINE_JSON_TAIL_KEYS: [&str; 10] = [
-    "dssd1_temperature",
-    "fee1_current",
-    "fee1_temperature",
-    "dssd7_temperature",
-    "fee2_current",
-    "fee2_temperature",
-    "fee1_threshold",
-    "fee2_threshold",
-    "dssd1_temperature_dup",
-    "dssd4_temperature",
+    "dssd1Temperatures",
+    "fee1Current",
+    "fee1Temperature",
+    "dssd7Temperature",
+    "fee2Current",
+    "fee2Temperature",
+    "fee1Threshold",
+    "fee2Threshold",
+    "dssd1TemperatureDup",
+    "dssd4Temperature",
 ];
 
 /// One Data Table row as a JSON object matching
 fn baseline_row_json(row: &BaselineRow) -> serde_json::Value {
     use crate::json_view::{num_or_str, object};
 
-    let layer_blocks = |blocks: &[Vec<i32>]| {
-        object(
-            blocks
-                .iter()
-                .enumerate()
-                .map(|(i, b)| (format!("block_{}", i + 1), serde_json::Value::from(b.clone()))),
-        )
-    };
-    let tail = object(
+    let mut data_acquisition: Vec<(String, serde_json::Value)> = Vec::new();
+    for i in 0..row.l1_blocks.len() {
+        data_acquisition.push((format!("L1_{}", i + 1), serde_json::Value::from(row.l1_blocks[i].clone())));
+        data_acquisition.push((format!("L2_{}", i + 1), serde_json::Value::from(row.l2_blocks[i].clone())));
+    }
+    for i in 0..row.l6_blocks.len() {
+        data_acquisition.push((format!("L6_{}", i + 1), serde_json::Value::from(row.l6_blocks[i].clone())));
+        data_acquisition.push((format!("L7_{}", i + 1), serde_json::Value::from(row.l7_blocks[i].clone())));
+    }
+
+    let dssdfee = object(
         BASELINE_JSON_TAIL_KEYS
             .iter()
             .zip(&row.tail)
@@ -206,31 +219,25 @@ fn baseline_row_json(row: &BaselineRow) -> serde_json::Value {
         (
             "header".to_string(),
             object([
-                ("packet_sync_code".to_string(), num_or_str(&row.packet_sync)),
-                ("packet_id".to_string(), row.package_id.into()),
-                ("pakcet_seq".to_string(), row.packet_sequence.into()),
-                (
-                    "packet_data_len".to_string(),
-                    row.packet_data_length.into(),
-                ),
-                (
-                    "time".to_string(),
-                    format_event_time(row.time).into(),
-                ),
-                ("data_type".to_string(), row.data_type.clone().into()),
-                ("sample_index".to_string(), row.sample_index.into()),
+                ("packetSyncCode".to_string(), num_or_str(&row.packet_sync)),
+                ("packetID".to_string(), row.package_id.into()),
+                ("packetSeq".to_string(), row.packet_sequence.into()),
+                ("packetDataLen".to_string(), row.packet_data_length.into()),
+                ("time".to_string(), format_event_time(row.time).into()),
+                ("dataType".to_string(), row.data_type.clone().into()),
             ]),
         ),
         (
-            "data_acquisition".to_string(),
+            "data".to_string(),
             object([
-                ("l1".to_string(), layer_blocks(&row.l1_blocks)),
-                ("l2".to_string(), layer_blocks(&row.l2_blocks)),
-                ("l6".to_string(), layer_blocks(&row.l6_blocks)),
-                ("l7".to_string(), layer_blocks(&row.l7_blocks)),
+                ("sampleIndex".to_string(), row.sample_index.into()),
+                ("dataAcquisition".to_string(), object(data_acquisition)),
             ]),
         ),
-        ("tail".to_string(), tail),
+        (
+            "housekeeping".to_string(),
+            object([("dssdfee".to_string(), dssdfee)]),
+        ),
         ("reserved".to_string(), row.reserved_hex.clone().into()),
         ("checksum".to_string(), row.checksum_hex.clone().into()),
     ])
