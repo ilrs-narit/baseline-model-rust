@@ -1,74 +1,39 @@
 //! Data Table decoding for Calibration mode
 
-use crate::observation::data_processor::{formula_decode, get_date_time_from_hex_data, parse_line_header_fields};
+use crate::io::science_packet::validate_science_hex_packet;
+use crate::observation::data_processor::{get_date_time_from_hex_data, parse_line_header_fields};
 use chrono::{DateTime, Utc};
-
-/// One decoded tail field (Byte 1426-1445), 2 bytes each.
-pub struct CalibrationTailField {
-    pub label: &'static str,
-    pub byte_start: usize,
-}
-
-const fn tail(label: &'static str, byte_start: usize) -> CalibrationTailField {
-    CalibrationTailField { label, byte_start }
-}
-
-/// Byte 1426-1445: 10 fields, 2 bytes each.
-pub const CALIBRATION_TAIL_FIELDS: &[CalibrationTailField] = &[
-    tail("DSSD 1 Temperature", 1426),
-    tail("FEE1 Current", 1428),
-    tail("FEE1 Temperature", 1430),
-    tail("DSSD 7 Temperature", 1432),
-    tail("FEE2 Current", 1434),
-    tail("FEE2 Temperature", 1436),
-    tail("FEE1 Threshold", 1438),
-    tail("FEE2 Threshold", 1440),
-    tail("DSSD 1 Temperature (dup)", 1442),
-    tail("DSSD 4 Temperature", 1444),
-];
 
 const VOLTAGE_STEPS: usize = 11;
 const BLOCK_START: usize = 18;
-/// Each voltage step's 128 bytes hold L1, L2, L6, L7 back-to-back (32B each) -
-const STEP_STRIDE: usize = 128;
 const BLOCK_LEN: usize = 32;
-const L1_LAYER_OFFSET: usize = 0;
-const L2_LAYER_OFFSET: usize = 32;
-const L6_LAYER_OFFSET: usize = 64;
-const L7_LAYER_OFFSET: usize = 96;
-
-/// Layer names in on-wire order within each voltage step's 128-byte block.
-const LAYER_NAMES: [(&str, usize); 4] = [
-    ("L1", L1_LAYER_OFFSET),
-    ("L2", L2_LAYER_OFFSET),
-    ("L6", L6_LAYER_OFFSET),
-    ("L7", L7_LAYER_OFFSET),
-];
-
-const RESERVED_START: usize = 1446;
-const RESERVED_LEN: usize = 616; // Byte 1446-2061
+const BLOCK_COUNT: usize = VOLTAGE_STEPS * 4;
+const RESERVED_START: usize = 1426;
+const RESERVED_LEN: usize = 636; // Byte 1426-2061
 const CHECKSUM_START: usize = 2062;
 const CHECKSUM_LEN: usize = 2; // Byte 2062-2063
 
-/// One decoded 32-byte block column (e.g. "0.0V L1"): 16 values, 2 bytes
+/// One decoded 32-byte block column (e.g. "0.05V L1"): 16 values, 2 bytes
 /// each, decoded to decimal.
 pub struct CalibrationBlockField {
     pub label: String,
     pub byte_start: usize,
 }
 
-/// Byte 18-1425: 44 columns (11 voltage steps x 4 layers L1/L2/L6/L7, in
-/// that order within each step), one label + byte offset per 32-byte block.
+/// Byte 18-1425: L1/L2 at all 11 voltage steps, followed by L6/L7.
 pub fn calibration_block_fields() -> Vec<CalibrationBlockField> {
-    (0..VOLTAGE_STEPS)
-        .flat_map(|step| {
-            let voltage = step as f64 * 0.1;
-            LAYER_NAMES.iter().map(move |&(name, layer_offset)| CalibrationBlockField {
-                label: format!("{:.1}V {}", voltage, name),
-                byte_start: BLOCK_START + STEP_STRIDE * step + layer_offset,
-            })
-        })
-        .collect()
+    let mut fields = Vec::with_capacity(BLOCK_COUNT);
+    for layers in [["L1", "L2"], ["L6", "L7"]] {
+        for step in 0..VOLTAGE_STEPS {
+            for layer in layers {
+                fields.push(CalibrationBlockField {
+                    label: format!("{:.2}V {}", step as f64 * 0.05, layer),
+                    byte_start: BLOCK_START + fields.len() * BLOCK_LEN,
+                });
+            }
+        }
+    }
+    fields
 }
 
 /// One decoded raw line for the Calibration mode Data Table tab.
@@ -84,8 +49,6 @@ pub struct CalibrationLineResult {
     /// 44 columns (11 voltage steps x 4 layers, matching `calibration_block_fields`),
     /// each holding 16 decoded decimal values.
     pub blocks: Vec<Vec<i32>>,
-    /// Decoded values for `CALIBRATION_TAIL_FIELDS`, in that same order.
-    pub tail: Vec<String>,
     pub reserved_hex: String,
     pub checksum_hex: String,
 }
@@ -109,31 +72,15 @@ fn decode_block(hex_data: &[String], byte_start: usize) -> Vec<i32> {
 
 /// Decodes one raw calibration line into a Data Table row.
 pub fn parse_calibration_line(hex_data: &[String]) -> Option<CalibrationLineResult> {
-    if hex_data.len() < CHECKSUM_START + CHECKSUM_LEN {
+    if !validate_science_hex_packet(hex_data, 0x00AB) {
         return None;
     }
     let header = parse_line_header_fields(hex_data)?;
     let time = get_date_time_from_hex_data(hex_data).ok()?;
     let sample_index = dec_pair(hex_data, 16);
 
-    let mut blocks = Vec::with_capacity(VOLTAGE_STEPS * LAYER_NAMES.len());
-    for step in 0..VOLTAGE_STEPS {
-        for &(_, layer_offset) in LAYER_NAMES.iter() {
-            let byte_start = BLOCK_START + STEP_STRIDE * step + layer_offset;
-            blocks.push(decode_block(hex_data, byte_start));
-        }
-    }
-
-    let tail = CALIBRATION_TAIL_FIELDS
-        .iter()
-        .map(|f| {
-            let raw = dec_pair(hex_data, f.byte_start);
-            if f.label == "FEE2 Temperature" {
-                format!("{:.4}", formula_decode(raw as f64))
-            } else {
-                raw.to_string()
-            }
-        })
+    let blocks = (0..BLOCK_COUNT)
+        .map(|block| decode_block(hex_data, BLOCK_START + block * BLOCK_LEN))
         .collect();
 
     Some(CalibrationLineResult {
@@ -145,8 +92,80 @@ pub fn parse_calibration_line(hex_data: &[String]) -> Option<CalibrationLineResu
         data_type: header.data_type,
         sample_index,
         blocks,
-        tail,
         reserved_hex: hex_span(hex_data, RESERVED_START, RESERVED_LEN),
         checksum_hex: hex_span(hex_data, CHECKSUM_START, CHECKSUM_LEN),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::calibration::CalibrationAccumulator;
+
+    fn calibration_packet() -> Vec<String> {
+        let mut bytes = vec![0u8; 2064];
+        for (offset, value) in [
+            (0, 0xE225u16), (2, 0x08B0), (4, 0xC000), (6, 0x0807),
+            (14, 0x00AB), (16, 1),
+            // MATCH table 3: L1/L2 voltage sweep, then L6/L7 voltage sweep.
+            (18, 101), (50, 201), (82, 102), (114, 202),
+            (658, 111), (690, 211), (722, 601), (754, 701),
+            (786, 602), (818, 702), (1362, 611), (1394, 711),
+        ] {
+            bytes[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+        }
+        bytes[1426..2062].fill(0xA5);
+        let sum = bytes[8..2062].iter().fold(0u16, |sum, &byte| sum.wrapping_add(byte as u16));
+        bytes[2062..].copy_from_slice(&sum.to_be_bytes());
+        bytes.iter().map(|byte| format!("{byte:02X}")).collect()
+    }
+
+    #[test]
+    fn decodes_specification_voltage_sweeps_without_mixing_layers() {
+        let packet = calibration_packet();
+        let fields = calibration_block_fields();
+        for (index, label, offset) in [
+            (0, "0.00V L1", 18), (1, "0.00V L2", 50),
+            (2, "0.05V L1", 82), (21, "0.50V L2", 690),
+            (22, "0.00V L6", 722), (23, "0.00V L7", 754),
+            (42, "0.50V L6", 1362), (43, "0.50V L7", 1394),
+        ] {
+            assert_eq!(fields[index].label, label);
+            assert_eq!(fields[index].byte_start, offset);
+        }
+
+        let decoded = parse_calibration_line(&packet).unwrap();
+        assert_eq!(decoded.blocks.len(), 44);
+        assert!(decoded.blocks.iter().all(|block| block.len() == 16));
+        assert_eq!(decoded.blocks[2][0], 102);
+        assert_eq!(decoded.blocks[22][0], 601);
+        assert_eq!(decoded.blocks[43][0], 711);
+        assert_eq!(decoded.reserved_hex, "A5".repeat(636));
+
+        let mut accumulator = CalibrationAccumulator::default();
+        accumulator.process_calibration(&packet);
+        assert_eq!(accumulator.l1_columns[0][..2], [101.0, 102.0]);
+        assert_eq!(accumulator.l2_columns[0][10], 211.0);
+        assert_eq!(accumulator.l6_columns[0][..2], [601.0, 602.0]);
+        assert_eq!(accumulator.l7_columns[0][10], 711.0);
+    }
+
+    #[test]
+    fn rejects_bad_checksum_wrong_mode_and_incomplete_packets() {
+        let packet = calibration_packet();
+        let mut bad_checksum = packet.clone();
+        bad_checksum[18] = "FF".to_string();
+        let mut wrong_mode = packet.clone();
+        wrong_mode[15] = "AC".to_string();
+        let sum = wrong_mode[8..2062].iter().map(|byte| u16::from_str_radix(byte, 16).unwrap()).fold(0u16, u16::wrapping_add);
+        wrong_mode[2062] = format!("{:02X}", sum >> 8);
+        wrong_mode[2063] = format!("{:02X}", sum & 0xFF);
+        for invalid in [bad_checksum, wrong_mode, packet[..2063].to_vec()] {
+            assert!(parse_calibration_line(&invalid).is_none());
+            let mut accumulator = CalibrationAccumulator::default();
+            accumulator.process_calibration(&invalid);
+            assert!(accumulator.l1_columns.iter().all(Vec::is_empty));
+            assert!(accumulator.l7_columns.iter().all(Vec::is_empty));
+        }
+    }
 }

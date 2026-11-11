@@ -2,12 +2,11 @@
 
 use baseline_core::calibration::{
     calibration_block_fields, parse_calibration_line, CalibrationAccumulator, CalibrationLineResult,
-    CALIBRATION_TAIL_FIELDS,
 };
 use baseline_core::io;
 use baseline_core::math::MathService;
 use baseline_core::models::shared::AppConstants;
-use baseline_core::observation::data_processor::{split_hex_data, validate_header};
+use baseline_core::observation::data_processor::split_hex_data;
 use chrono::{DateTime, Utc};
 use egui::Color32;
 use std::path::PathBuf;
@@ -36,8 +35,6 @@ struct CalibrationRow {
     data_type: String,
     sample_index: i32,
     blocks: Vec<Vec<i32>>,
-    /// Values for `CALIBRATION_TAIL_FIELDS`, in that same order.
-    tail: Vec<String>,
     reserved_hex: String,
     checksum_hex: String,
 }
@@ -59,7 +56,6 @@ impl From<CalibrationLineResult> for CalibrationRow {
             data_type: r.data_type,
             sample_index: r.sample_index,
             blocks: r.blocks,
-            tail: r.tail,
             reserved_hex: r.reserved_hex,
             checksum_hex: r.checksum_hex,
         }
@@ -113,10 +109,7 @@ fn calibration_table_headers() -> Vec<String> {
     for field in calibration_block_fields() {
         headers.push(format!("{} (Byte {}-{})", field.label, field.byte_start, field.byte_start + 31));
     }
-    for field in CALIBRATION_TAIL_FIELDS {
-        headers.push(format!("{} (Byte {}-{})", field.label, field.byte_start, field.byte_start + 1));
-    }
-    headers.push("Reserved (Byte 1446-2061)".to_string());
+    headers.push("Reserved (Byte 1426-2061)".to_string());
     headers.push("Checksum (Byte 2062-2063)".to_string());
     headers
 }
@@ -133,7 +126,6 @@ fn calibration_row_cells(row: &CalibrationRow) -> Vec<String> {
         row.sample_index.to_string(),
     ];
     cells.extend(row.blocks.iter().map(|b| join_i32_values(b)));
-    cells.extend(row.tail.iter().cloned());
     cells.push(row.reserved_hex.clone());
     cells.push(row.checksum_hex.clone());
     cells
@@ -149,21 +141,7 @@ fn csv_field(value: &str) -> String {
     }
 }
 
-/// Housekeeping `dssdfee` keys for the JSON view
-const CALIBRATION_JSON_TAIL_KEYS: [&str; 10] = [
-    "dssd1Temperatures",
-    "fee1Current",
-    "fee1Temperature",
-    "dssd7Temperature",
-    "fee2Current",
-    "fee2Temperature",
-    "fee1Threshold",
-    "fee2Threshold",
-    "dssd1TemperatureDup",
-    "dssd4Temperature",
-];
-
-/// Number of voltage steps in the calibration payload (`00V`..`10V`).
+/// Number of voltage steps in the calibration payload (0.00V..0.50V).
 const CALIBRATION_VOLTAGE_STEPS: usize = 11;
 
 /// One Data Table row as a JSON object
@@ -171,28 +149,20 @@ fn calibration_row_json(row: &CalibrationRow) -> serde_json::Value {
     use crate::json_view::{num_or_str, object};
 
     let steps = object((0..CALIBRATION_VOLTAGE_STEPS).map(|step| {
-        let base = step * 4;
         let layers = object(
-            ["L1", "L2", "L6", "L7"]
-                .iter()
-                .enumerate()
-                .map(|(i, name)| {
+            [("L1", step * 2), ("L2", step * 2 + 1), ("L6", 22 + step * 2), ("L7", 23 + step * 2)]
+                .into_iter()
+                .map(|(name, block)| {
                     let list = row
                         .blocks
-                        .get(base + i)
+                        .get(block)
                         .map(|b| serde_json::Value::from(b.clone()))
                         .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
                     (name.to_string(), list)
                 }),
         );
-        (format!("{step:02}V"), layers)
+        (format!("{:.2}V", step as f64 * 0.05), layers)
     }));
-    let dssdfee = object(
-        CALIBRATION_JSON_TAIL_KEYS
-            .iter()
-            .zip(&row.tail)
-            .map(|(k, v)| (k.to_string(), num_or_str(v))),
-    );
 
     object([
         (
@@ -213,10 +183,6 @@ fn calibration_row_json(row: &CalibrationRow) -> serde_json::Value {
                 ("voltageStep".to_string(), steps),
             ]),
         ),
-        (
-            "housekeeping".to_string(),
-            object([("dssdfee".to_string(), dssdfee)]),
-        ),
         ("reserved".to_string(), row.reserved_hex.clone().into()),
         ("checksum".to_string(), row.checksum_hex.clone().into()),
     ])
@@ -224,6 +190,40 @@ fn calibration_row_json(row: &CalibrationRow) -> serde_json::Value {
 
 fn calibration_rows_json(rows: &[CalibrationRow]) -> Vec<serde_json::Value> {
     rows.iter().map(calibration_row_json).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exports_specification_voltage_steps_and_reserved_bytes() {
+        let row = CalibrationRow {
+            packet_sync: "E225".to_string(),
+            package_id: 0x08B0,
+            packet_sequence: 0xC000,
+            packet_data_length: 0x0807,
+            time: DateTime::from_timestamp(0, 0).unwrap(),
+            data_type: "00AB".to_string(),
+            sample_index: 1,
+            blocks: (0..44).map(|block| vec![block; 16]).collect(),
+            reserved_hex: "A5".repeat(636),
+            checksum_hex: "0000".to_string(),
+        };
+        let json = calibration_row_json(&row);
+        let steps = &json["data"]["voltageStep"];
+        assert_eq!(steps["0.05V"]["L1"][0], 2);
+        assert_eq!(steps["0.05V"]["L2"][0], 3);
+        assert_eq!(steps["0.05V"]["L6"][0], 24);
+        assert_eq!(steps["0.05V"]["L7"][0], 25);
+        assert_eq!(steps["0.50V"]["L7"][0], 43);
+        assert_eq!(steps.as_object().unwrap().len(), 11);
+        assert!(json.get("housekeeping").is_none());
+        assert_eq!(json["reserved"], row.reserved_hex);
+        let headers = calibration_table_headers();
+        assert_eq!(headers.len(), calibration_row_cells(&row).len());
+        assert!(headers.iter().any(|header| header == "Reserved (Byte 1426-2061)"));
+    }
 }
 
 enum WorkerMsg {
@@ -833,25 +833,16 @@ fn read_data_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>) {
     let mut accumulator = CalibrationAccumulator::default();
     accumulator.reset(total.max(1));
     let mut table_rows: Vec<CalibrationRow> = Vec::with_capacity(total);
+    let mut rejected = 0;
 
     for (index, segment) in segments.iter().enumerate() {
         let hex_data = split_hex_data(segment);
 
-        if index == 0 {
-            let valid = validate_header(&hex_data);
-            let _ = tx.send(WorkerMsg::Status(
-                if valid {
-                    "Checksum OK. Reading data...".to_string()
-                } else {
-                    "Checksum Mismatch. Reading data...".to_string()
-                },
-                if valid { Color32::GRAY } else { Color32::RED },
-            ));
-        }
-
-        accumulator.process_calibration(&hex_data);
         if let Some(line) = parse_calibration_line(&hex_data) {
+            accumulator.process_calibration(&hex_data);
             table_rows.push(line.into());
+        } else {
+            rejected += 1;
         }
 
         if index % 1000 == 0 {
@@ -864,6 +855,7 @@ fn read_data_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>) {
         }
     }
 
+    let processed = table_rows.len();
     let _ = tx.send(WorkerMsg::DataLoaded(accumulator));
     let _ = tx.send(WorkerMsg::TableRows(table_rows));
 
@@ -875,8 +867,8 @@ fn read_data_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>) {
         duration: format!("{} ms", duration.num_milliseconds()),
     });
     let _ = tx.send(WorkerMsg::Status(
-        format!("Processed {total} events."),
-        Color32::from_rgb(50, 200, 50),
+        format!("Processed {processed} packets; rejected {rejected} invalid packets."),
+        if rejected > 0 { Color32::YELLOW } else { Color32::from_rgb(50, 200, 50) },
     ));
     let _ = tx.send(WorkerMsg::Progress(100.0));
     let _ = tx.send(WorkerMsg::Busy(false));

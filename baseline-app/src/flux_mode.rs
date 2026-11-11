@@ -1,6 +1,6 @@
 //! Port of Flux mode
 
-use baseline_core::flux::{parse_flux_line, FluxAccumulator, FluxLineResult, FLUX_TAIL_FIELDS, PARTICLE_COUNTS_LAYERS};
+use baseline_core::flux::{parse_flux_line, FluxAccumulator, FluxLineResult, PARTICLE_COUNTS_LAYERS};
 use baseline_core::io;
 use baseline_core::models::shared::AppConstants;
 use baseline_core::observation::data_processor::split_hex_data;
@@ -43,8 +43,6 @@ struct FluxRow {
     particle_counts: Vec<i32>,
     /// Particle Info (Byte 32-2031): 1000 decoded decimal values.
     particle_info: Vec<i32>,
-    /// Values for `FLUX_TAIL_FIELDS`, in that same order
-    tail: Vec<String>,
     reserved_hex: String,
     checksum_hex: String,
 }
@@ -61,7 +59,6 @@ impl From<FluxLineResult> for FluxRow {
             particle_time: r.particle_time,
             particle_counts: r.particle_counts,
             particle_info: r.particle_info,
-            tail: r.tail,
             reserved_hex: r.reserved_hex,
             checksum_hex: r.checksum_hex,
         }
@@ -118,10 +115,7 @@ fn flux_table_headers() -> Vec<String> {
         headers.push(format!("Particle Counts L{} (Byte {start}-{})", i + 1, start + 1));
     }
     headers.push("Particle Info (Byte 32-2031)".to_string());
-    for field in FLUX_TAIL_FIELDS {
-        headers.push(format!("{} (Byte {}-{})", field.label, field.byte_start, field.byte_start + 1));
-    }
-    headers.push("Reserved (Byte 2056-2061)".to_string());
+    headers.push("Reserved (Byte 2032-2061)".to_string());
     headers.push("Checksum (Byte 2062-2063)".to_string());
     headers
 }
@@ -139,7 +133,6 @@ fn flux_row_cells(row: &FluxRow) -> Vec<String> {
     ];
     cells.extend(row.particle_counts.iter().map(|c| c.to_string()));
     cells.push(row.particle_info.iter().map(i32::to_string).collect::<Vec<_>>().join(", "));
-    cells.extend(row.tail.iter().cloned());
     cells.push(row.reserved_hex.clone());
     cells.push(row.checksum_hex.clone());
     cells
@@ -154,22 +147,6 @@ fn csv_field(value: &str) -> String {
         value.to_string()
     }
 }
-
-/// Housekeeping keys for the JSON view: `dssdfee` (first 8) then `BGO` (last 4)
-const FLUX_JSON_TAIL_KEYS: [&str; 12] = [
-    "dssd1Temperatures",
-    "fee1Current",
-    "fee1Temperature",
-    "dssd7Temperature",
-    "fee2Current",
-    "fee2Temperature",
-    "fee1Threshold",
-    "fee2Threshold",
-    "bgo1BiasVoltage",
-    "bgo2BiasVoltage",
-    "bgo3BiasVoltage",
-    "bgo2Temperature",
-];
 
 /// One Data Table row as a JSON object
 fn flux_row_json(row: &FluxRow) -> serde_json::Value {
@@ -196,15 +173,9 @@ fn flux_row_json(row: &FluxRow) -> serde_json::Value {
         ("particleInfo".to_string(), serde_json::Value::from(row.particle_info.clone())),
     ]);
 
-    let mut tail_values = FLUX_JSON_TAIL_KEYS.iter().zip(&row.tail).map(|(k, v)| (k.to_string(), num_or_str(v)));
-    let dssdfee = object((&mut tail_values).take(8));
-    let bgo = object(tail_values);
-    let housekeeping = object([("dssdfee".to_string(), dssdfee), ("BGO".to_string(), bgo)]);
-
     object([
         ("header".to_string(), header),
         ("data".to_string(), data),
-        ("housekeeping".to_string(), housekeeping),
         ("reserved".to_string(), row.reserved_hex.clone().into()),
         ("checksum".to_string(), row.checksum_hex.clone().into()),
     ])
@@ -569,6 +540,14 @@ impl FluxMode {
         self.accumulator = FluxAccumulator::default();
         self.rows.clear();
         self.json_preview.clear();
+        self.data_count = 0;
+        self.header_info_text.clear();
+        self.header_check_status.clear();
+        for layer in &mut self.layers {
+            layer.x_data.clear();
+            layer.y_data.clear();
+            layer.stats_text = "No Data".to_string();
+        }
 
         let files = self.selected_files.clone();
         let delay_time = self.delay_time;
@@ -748,8 +727,10 @@ fn read_data_worker(files: Vec<PathBuf>, delay_time: i32, threshold: i32, tx: Se
     };
 
     if rows.is_empty() {
+        let _ = tx.send(WorkerMsg::DataCount(0));
+        let _ = tx.send(WorkerMsg::TableRows(Vec::new()));
         let _ = tx.send(WorkerMsg::Status(
-            "No valid E225 segments found.".to_string(),
+            "No valid Flux packets found (0 accepted).".to_string(),
             Color32::RED,
         ));
         let _ = tx.send(WorkerMsg::Busy(false));
@@ -757,14 +738,15 @@ fn read_data_worker(files: Vec<PathBuf>, delay_time: i32, threshold: i32, tx: Se
     }
 
     let total_steps = rows.len();
-    let _ = tx.send(WorkerMsg::DataCount(total_steps));
 
     let mut accumulator = FluxAccumulator::default();
     let mut last_hex: Option<&String> = None;
     let mut table_rows: Vec<FluxRow> = Vec::with_capacity(total_steps);
 
     for (i, hex_string) in rows.iter().enumerate() {
-        accumulator.process_flux_observation(hex_string);
+        if !accumulator.process_flux_observation(hex_string) {
+            continue;
+        }
         let hex_data = split_hex_data(hex_string);
         if let Some(line) = parse_flux_line(&hex_data) {
             table_rows.push(line.into());
@@ -788,6 +770,10 @@ fn read_data_worker(files: Vec<PathBuf>, delay_time: i32, threshold: i32, tx: Se
         stop: stop.format("%H:%M:%S").to_string(),
         duration: format!("{} ms", duration.num_milliseconds()),
     });
+
+    let accepted = table_rows.len();
+    let rejected = total_steps - accepted;
+    let _ = tx.send(WorkerMsg::DataCount(accepted));
 
     if let Some(hex) = last_hex {
         let hex_data = baseline_core::observation::data_processor::split_hex_data(hex);
@@ -830,8 +816,12 @@ fn read_data_worker(files: Vec<PathBuf>, delay_time: i32, threshold: i32, tx: Se
     }
 
     let _ = tx.send(WorkerMsg::Status(
-        "Process Complete".to_string(),
-        Color32::from_rgb(50, 200, 50),
+        if accepted == 0 {
+            format!("No valid Flux packets found (0 accepted); skipped {rejected} other packets.")
+        } else {
+            format!("Processed {accepted} Flux packets; skipped {rejected} other packets.")
+        },
+        if accepted == 0 || rejected > 0 { Color32::YELLOW } else { Color32::from_rgb(50, 200, 50) },
     ));
     let _ = tx.send(WorkerMsg::Progress(100.0));
     let _ = tx.send(WorkerMsg::Busy(false));
@@ -846,4 +836,34 @@ fn check_header_worker(file_path: PathBuf, delay_time: i32, threshold: i32, tx: 
         Color32::GRAY,
     ));
     let _ = tx.send(WorkerMsg::Busy(false));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reading_wrong_mode_or_corrupt_packets_returns_empty_results_and_warning() {
+        for mode in [0xABu8, 0xAC] {
+            let mut packet = vec![0u8; 2064];
+            packet[..8].copy_from_slice(&[0xE2, 0x25, 0x08, 0xB0, 0xC0, 0, 0x08, 0x07]);
+            packet[15] = mode;
+            packet[2062..].copy_from_slice(&(mode as u16).to_be_bytes());
+            if mode == 0xAC {
+                packet[2063] ^= 1;
+            }
+            let path = std::env::temp_dir().join(format!("match-flux-rejected-{}-{mode}.txt", std::process::id()));
+            let hex = packet.iter().map(|byte| format!("{byte:02X}")).collect::<String>();
+            std::fs::write(&path, hex).unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            read_data_worker(vec![path.clone()], 0, 0, tx);
+            std::fs::remove_file(path).unwrap();
+            let messages = rx.into_iter().collect::<Vec<_>>();
+            assert!(messages.iter().any(|message| matches!(message, WorkerMsg::DataCount(0))));
+            assert!(messages.iter().any(|message| matches!(message, WorkerMsg::TableRows(rows) if rows.is_empty())));
+            assert!(messages.iter().any(|message| matches!(message, WorkerMsg::Status(text, color) if text.contains("0 accepted") && *color != Color32::from_rgb(50, 200, 50))));
+            assert!(!messages.iter().any(|message| matches!(message, WorkerMsg::LayersReady(_))));
+            assert!(matches!(messages.last(), Some(WorkerMsg::Busy(false))));
+        }
+    }
 }

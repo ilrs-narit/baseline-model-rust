@@ -4,19 +4,9 @@
 //! egui app layer.
 
 use crate::models::flux::FluxDataResult;
+use crate::io::science_packet::validate_science_packet;
+use crate::observation::data_processor::{get_date_time_from_hex_data, split_hex_data};
 use chrono::{DateTime, Utc};
-
-/// `seconds_part` + `milliseconds_part` behave like .NET's
-/// `DateTimeOffset.FromUnixTimeSeconds(seconds).AddMilliseconds(ms)`: the
-/// milliseconds are added as a precise offset (carrying into seconds as
-/// needed), not truncated.
-fn unix_from_seconds_and_millis(seconds_part: u32, milliseconds_part: u16) -> DateTime<Utc> {
-    let total_ms = seconds_part as i64 * 1000 + milliseconds_part as i64;
-    let total_secs = total_ms.div_euclid(1000);
-    let remainder_ms = total_ms.rem_euclid(1000);
-    DateTime::from_timestamp(total_secs, (remainder_ms * 1_000_000) as u32)
-        .unwrap_or(DateTime::from_timestamp(0, 0).unwrap())
-}
 
 /// Accumulates parsed flux packets across a session, mirroring the private
 /// list fields on `FluxViewModel`.
@@ -41,12 +31,19 @@ impl FluxAccumulator {
     }
 
     /// Parses one flux-observation hex packet and appends it, matching
-    /// `ProcessFluxObservation`. Returns `false` (no-op) for undersized input.
+    /// `ProcessFluxObservation`. Returns `false` (no-op) for invalid packets.
     pub fn process_flux_observation(&mut self, hex_string: &str) -> bool {
-        if hex_string.len() < 4064 {
+        if hex_string.len() != 4128 {
             return false;
         }
         let hex = hex_string.as_bytes();
+        let Some(bytes) = (0..hex.len()).step_by(2)
+            .map(|offset| parse_hex_byte(hex, offset)).collect::<Option<Vec<_>>>() else {
+            return false;
+        };
+        if !validate_science_packet(&bytes, 0x00AC) {
+            return false;
+        }
 
         let t0 = match parse_hex_byte(hex, 32) {
             Some(v) => v,
@@ -163,32 +160,10 @@ pub struct FluxLayerPlot {
     pub stats_text: String,
 }
 
-/// Matches the standalone `GetDateTimeFromHexData(string)` in
-/// `FluxViewModel.DataProcessing.cs`. Unlike the Observation-mode version in
-/// `observation::data_processor` (which counts from a 2024-10-01 base, per
-/// that instrument's own timecode epoch), this one still treats
-/// `seconds_part` as a literal Unix timestamp - the two haven't been
-/// reconciled, so Flux-mode timestamps currently read ~1971 for the same
-/// raw bytes that decode to a 2020s date under Observation mode.
+/// Uses the same instrument timecode epoch as the other science modes.
 pub fn get_date_time_from_hex(hex_string: &str) -> DateTime<Utc> {
-    let hex = hex_string.as_bytes();
-    let epoch = || DateTime::from_timestamp(0, 0).unwrap();
-    if hex.len() < 28 {
-        return epoch();
-    }
-
-    let mut timecode = [0u8; 6];
-    for (i, slot) in timecode.iter_mut().enumerate() {
-        match parse_hex_byte(hex, 16 + i * 2) {
-            Some(v) => *slot = v,
-            None => return epoch(),
-        }
-    }
-
-    let seconds_part = u32::from_be_bytes([timecode[0], timecode[1], timecode[2], timecode[3]]);
-    let milliseconds_part = u16::from_be_bytes([timecode[4], timecode[5]]);
-
-    unix_from_seconds_and_millis(seconds_part, milliseconds_part)
+    get_date_time_from_hex_data(&split_hex_data(hex_string))
+        .unwrap_or_else(|_| DateTime::from_timestamp(0, 0).unwrap())
 }
 
 #[derive(Debug, Clone)]
@@ -215,13 +190,7 @@ pub fn process_header_internal(hex_data: &[String]) -> Option<HeaderParseResult>
     let packet_seq = format!("Packet Sequence: {} {}", hex_data[4], hex_data[5]);
     let packet_data_len = format!("Packet data length: {} {}", hex_data[6], hex_data[7]);
 
-    let timecode: Vec<u8> = hex_data[8..14]
-        .iter()
-        .map(|h| u8::from_str_radix(h, 16).unwrap_or(0))
-        .collect();
-    let sec_part = u32::from_be_bytes([timecode[0], timecode[1], timecode[2], timecode[3]]);
-    let ms_part = u16::from_be_bytes([timecode[4], timecode[5]]);
-    let dt = unix_from_seconds_and_millis(sec_part, ms_part);
+    let dt = get_date_time_from_hex_data(hex_data).ok()?;
     let timestamp = format!("Timestamp: {}", dt.format("%Y-%b-%d %H:%M:%S%.3f"));
 
     let data_type = format!("Data Type: {} {}", hex_data[14], hex_data[15]);
@@ -254,6 +223,9 @@ fn parse_hex_byte(hex: &[u8], char_offset: usize) -> Option<u8> {
         return None;
     }
     let s = std::str::from_utf8(&hex[char_offset..char_offset + 2]).ok()?;
+    if !s.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
     u8::from_str_radix(s, 16).ok()
 }
 

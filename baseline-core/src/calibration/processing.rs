@@ -1,4 +1,6 @@
 //! Accumulation logic for Calibration mode's per-channel histograms.
+use crate::io::science_packet::validate_science_hex_packet;
+
 const VOLTAGE_SCALE: f64 = (5.0 / 16383.0) * 1000.0;
 
 #[derive(Debug, Clone, Default)]
@@ -28,16 +30,12 @@ impl CalibrationAccumulator {
     }
 
     pub fn process_calibration(&mut self, hex_data: &[String]) {
-        if hex_data.len() < 18 {
+        if !validate_science_hex_packet(hex_data, 0x00AB) {
             return;
         }
 
         for i in 0..11usize {
-            let offset = 18 + 128 * i;
-
-            if offset + 128 > hex_data.len() {
-                continue;
-            }
+            let offset = 18 + 64 * i;
 
             for j in 0..16usize {
                 let l1_val = parse_hex_pair(hex_data, offset + j * 2);
@@ -48,11 +46,11 @@ impl CalibrationAccumulator {
                 self.l2_columns[j].push(l2_val);
                 self.l2_volt_columns[j].push(l2_val * VOLTAGE_SCALE);
 
-                let l6_val = parse_hex_pair(hex_data, offset + 64 + j * 2);
+                let l6_val = parse_hex_pair(hex_data, offset + 704 + j * 2);
                 self.l6_columns[j].push(l6_val);
                 self.l6_volt_columns[j].push(l6_val * VOLTAGE_SCALE);
 
-                let l7_val = parse_hex_pair(hex_data, offset + 96 + j * 2);
+                let l7_val = parse_hex_pair(hex_data, offset + 736 + j * 2);
                 self.l7_columns[j].push(l7_val);
                 self.l7_volt_columns[j].push(l7_val * VOLTAGE_SCALE);
             }

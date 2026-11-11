@@ -2,6 +2,7 @@
 //! streaming hex-segment parser (`ProcessFileStreamAsync`). Excel export/import
 //! for this service live in `baseline_excel.rs`.
 
+use crate::io::science_packet::validate_science_packet;
 use crate::models::baseline::BaselineData;
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -47,7 +48,7 @@ pub fn process_file_stream(
 
         for &b in &file_buffer[..bytes_read] {
             let c = b as char;
-            if is_hex_char(c) {
+            if !c.is_ascii_whitespace() {
                 hex_accumulator.push(c);
             }
         }
@@ -93,8 +94,11 @@ fn process_accumulated_hex(
 
         if header_index + CHUNK_SIZE <= buffer.len() {
             let segment = &buffer[header_index..header_index + CHUNK_SIZE];
-            process_single_segment(segment, results, l1l2_dec, l6l7_dec);
-            search_index = header_index + CHUNK_SIZE;
+            search_index = if process_single_segment(segment, results, l1l2_dec, l6l7_dec) {
+                header_index + CHUNK_SIZE
+            } else {
+                header_index + 1
+            };
         } else {
             *sb = buffer[search_index..].iter().collect();
             return;
@@ -123,7 +127,16 @@ fn process_single_segment(
     results: &mut Vec<BaselineData>,
     l1l2_dec: &mut [i32; BUFFER_SIZE],
     l6l7_dec: &mut [i32; BUFFER_SIZE],
-) {
+) -> bool {
+    if !segment.iter().copied().all(is_hex_char) {
+        return false;
+    }
+    let bytes = segment.chunks_exact(2)
+        .map(|pair| (hex_char_to_int(pair[0]) * 16 + hex_char_to_int(pair[1])) as u8)
+        .collect::<Vec<_>>();
+    if !validate_science_packet(&bytes, 0x00AE) {
+        return false;
+    }
     let sampling_packet = extract_sampling_packet(segment);
 
     for i in 0..SAMPLES_PER_SEGMENT {
@@ -146,6 +159,7 @@ fn process_single_segment(
         process_channels(&mut data, l1l2_dec, l6l7_dec);
         results.push(data);
     }
+    true
 }
 
 #[inline]

@@ -1,5 +1,6 @@
 //! Data Processing for Observation Mode
 
+use crate::io::science_packet::{validate_science_hex_packet, validate_science_packet};
 use crate::math::KalmanFilter;
 use crate::models::observation::{BgoData, BgoLayer, DetectorLayer, LayerData};
 use chrono::{DateTime, NaiveDate, Utc};
@@ -16,7 +17,6 @@ const FRAME_SIZE: usize = 256;
 const DSSD_HISTOGRAM_SIZE: usize = 16384;
 const BGO_HISTOGRAM_SIZE: usize = 4096;
 const MODERN_PACKET_LENGTH: u16 = 0x00F7;
-const LEGACY_PACKET_LENGTH: u16 = 0x002D;
 
 /// Contruct a line's tail fields
 pub struct LineTailField {
@@ -26,110 +26,40 @@ pub struct LineTailField {
     pub is_hex: bool,
 }
 
-const fn dec(label: &'static str, byte_start: usize, byte_len: usize) -> LineTailField {
-    LineTailField { label, byte_start, byte_len, is_hex: false }
-}
-
 pub const LINE_TAIL_FIELDS: &[LineTailField] = &[
-    dec("Galactic Electron Count", 186, 1),
-    dec("Albedo Electron Count", 187, 1),
-    dec("Galactic Ion Count", 188, 1),
-    dec("Albedo Ion Count", 189, 1),
-    dec("L1 Ion Threshold", 190, 2),
-    dec("L1 Electron Threshold", 192, 2),
-    dec("L2 Ion Particle", 194, 2),
-    dec("L2 Electron Particle", 196, 2),
-    dec("L3 Ion Particle", 198, 2),
-    dec("L3 Electron Particle", 200, 2),
-    dec("L4 Ion Particle", 202, 2),
-    dec("L4 Electron Particle", 204, 2),
-    dec("L5 Ion Particle", 206, 2),
-    dec("L5 Electron Particle", 208, 2),
-    dec("L6 Ion Particle", 210, 2),
-    dec("L6 Electron Particle", 212, 2),
-    dec("L7 Ion Particle", 214, 2),
-    dec("L7 Electron Particle", 216, 2),
-    dec("DSSD1 Temperature", 218, 2),
-    dec("FEE1 Current", 220, 2),
-    dec("FEE1 Temperature", 222, 2),
-    dec("DSSD7 Temperature", 224, 2),
-    dec("FEE2 Current", 226, 2),
-    dec("FEE2 Temperature", 228, 2),
-    dec("FEE1 Threshold", 230, 2),
-    dec("FEE2 Threshold", 232, 2),
-    dec("BGO1 Bias Voltage", 234, 2),
-    dec("BGO2 Bias Voltage", 236, 2),
-    dec("BGO3 Bias Voltage", 238, 2),
-    dec("BGO2 Temperature", 240, 2),
-    LineTailField { label: "Padding", byte_start: 242, byte_len: 12, is_hex: true },
-    LineTailField { label: "Checksum", byte_start: 254, byte_len: 2, is_hex: true },
+    LineTailField {
+        label: "Reserved",
+        byte_start: 186,
+        byte_len: 68,
+        is_hex: true,
+    },
+    LineTailField {
+        label: "Checksum",
+        byte_start: 254,
+        byte_len: 2,
+        is_hex: true,
+    },
 ];
 
-/// Formular decode for FEE2 Temperature and the BGO bias/temperature fields.
-pub(crate) fn formula_decode(x: f64) -> f64 {
-    65.17 * (x * 4096.0 / 3.3).powf(0.1401) - 141.6
-}
-
-pub(crate) fn calibrated_value(label: &str, raw: f64) -> Option<f64> {
-    match label {
-        "FEE2 Temperature" => Some(formula_decode(raw)),
-        "BGO1 Bias Voltage" | "BGO2 Bias Voltage" | "BGO3 Bias Voltage" | "BGO2 Temperature" => {
-            Some(formula_decode(raw) * 0.01)
-        }
-        _ => None,
-    }
-}
-
-/// Decoding LINE_TAIL_FIELDS
 fn parse_line_tail_fields(hex_data: &[String]) -> Vec<String> {
-    let byte = |i: usize| -> i32 { hex_data.get(i).and_then(|h| i32::from_str_radix(h, 16).ok()).unwrap_or(0) };
     LINE_TAIL_FIELDS
         .iter()
-        .map(|f| {
-            if f.is_hex {
-                (f.byte_start..f.byte_start + f.byte_len).map(|i| hex_data.get(i).cloned().unwrap_or_else(|| "00".to_string())).collect()
-            } else if f.byte_len == 1 {
-                let raw = byte(f.byte_start);
-                match calibrated_value(f.label, raw as f64) {
-                    Some(value) => format!("{value:.4}"),
-                    None => raw.to_string(),
-                }
-            } else {
-                let raw = (byte(f.byte_start) << 8) + byte(f.byte_start + 1);
-                match calibrated_value(f.label, raw as f64) {
-                    Some(value) => format!("{value:.4}"),
-                    None => raw.to_string(),
-                }
-            }
-        })
+        .map(|field| hex_data[field.byte_start..field.byte_start + field.byte_len].concat())
         .collect()
 }
 
 fn parse_line_tail_fields_from_bytes(frame: &[u8]) -> Arc<[String]> {
-    let byte = |index: usize| frame.get(index).copied().unwrap_or_default() as i32;
-    let values = LINE_TAIL_FIELDS
-        .iter()
-        .map(|field| {
-            if field.is_hex {
-                (field.byte_start..field.byte_start + field.byte_len)
-                    .map(|index| format!("{:02X}", byte(index)))
+    Arc::from(
+        LINE_TAIL_FIELDS
+            .iter()
+            .map(|field| {
+                frame[field.byte_start..field.byte_start + field.byte_len]
+                    .iter()
+                    .map(|byte| format!("{byte:02X}"))
                     .collect::<String>()
-            } else if field.byte_len == 1 {
-                let raw = byte(field.byte_start);
-                match calibrated_value(field.label, raw as f64) {
-                    Some(value) => format!("{value:.4}"),
-                    None => raw.to_string(),
-                }
-            } else {
-                let raw = (byte(field.byte_start) << 8) + byte(field.byte_start + 1);
-                match calibrated_value(field.label, raw as f64) {
-                    Some(value) => format!("{value:.4}"),
-                    None => raw.to_string(),
-                }
-            }
-        })
-        .collect::<Vec<_>>();
-    Arc::from(values)
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 #[derive(Debug, Clone, Default)]
@@ -290,13 +220,6 @@ impl ObservationDataProcessor {
                 offset += 1;
                 continue;
             }
-            let candidate_end = (offset + frame_nibbles).min(nibbles.len());
-            if let Some(next_header) = (offset + 1..candidate_end)
-                .find(|&candidate| valid_header_nibbles(&nibbles, candidate))
-            {
-                offset = next_header;
-                continue;
-            }
             let Some(frame) = frame_from_nibbles(&nibbles, offset) else {
                 offset += 1;
                 continue;
@@ -441,6 +364,9 @@ impl ObservationDataProcessor {
     }
 
     pub fn process_particles(&mut self, hex_data: &[String], line_time: DateTime<Utc>, header: &LineHeaderFields) {
+        if !validate_science_hex_packet(hex_data, 0x00AD) {
+            return;
+        }
         let line_tail: Arc<[String]> = Arc::from(parse_line_tail_fields(hex_data));
         for i in 0..PARTICLES_PER_LINE {
             let start = HEADER_OFFSET + PARTICLE_DATA_LENGTH * i;
@@ -496,7 +422,7 @@ impl ObservationDataProcessor {
             return Err("Invalid detector nibble".to_string());
         }
         let particle_time_raw = ((particle_data[0] as i32) << 8) + particle_data[1] as i32;
-        let milliseconds = particle_time_raw / 1000;
+        let milliseconds = particle_time_raw;
         let time = line_time + chrono::Duration::milliseconds(milliseconds as i64);
 
         // --- DSSD layers ---
@@ -562,16 +488,16 @@ impl ObservationDataProcessor {
         layer_data.pulse_height_x.push(ph_x as f64);
         layer_data.pulse_height_y.push(ph_y as f64);
 
-        // Strip key mapping (see original comments): detect==8 -> strip 0,
-        // otherwise detect+1 -> strip (detect+1).
-        let target_strip_x = if detect_x == 8 { 0 } else { (detect_x + 1) as i32 };
-        let target_strip_y = if detect_y == 8 { 0 } else { (detect_y + 1) as i32 };
-
-        if let Some(v) = layer_data.strip_x.get_mut(&target_strip_x) {
-            v.push(ph_x);
+        // Position zero denotes no data, not a detector strip.
+        if detect_x != 0 {
+            if let Some(v) = layer_data.strip_x.get_mut(&(detect_x as i32)) {
+                v.push(ph_x);
+            }
         }
-        if let Some(v) = layer_data.strip_y.get_mut(&target_strip_y) {
-            v.push(ph_y);
+        if detect_y != 0 {
+            if let Some(v) = layer_data.strip_y.get_mut(&(detect_y as i32)) {
+                v.push(ph_y);
+            }
         }
 
         (ph_x, ph_y)
@@ -736,7 +662,7 @@ fn frame_from_nibbles(nibbles: &[Option<u8>], offset: usize) -> Option<Vec<u8>> 
 
 fn parse_header_bytes(bytes: &[u8]) -> Option<LineHeaderFields> {
     let header = bytes.get(..HEADER_OFFSET)?;
-    if !valid_header_bytes(bytes) {
+    if !validate_science_packet(bytes, 0x00AD) {
         return None;
     }
     let packet_data_length = u16::from_be_bytes([header[6], header[7]]);
@@ -764,30 +690,14 @@ fn valid_header_nibbles(nibbles: &[Option<u8>], offset: usize) -> bool {
         && header[1] == Some(0x2)
         && header[2] == Some(0x2)
         && header[3] == Some(0x5)
-        && matches!(
-            u16::from_be_bytes([
-                (packet_length_high << 4) | packet_length_high_low,
-                (packet_length_low << 4) | packet_length_low_low,
-            ]),
-            MODERN_PACKET_LENGTH | LEGACY_PACKET_LENGTH
-        )
+        && u16::from_be_bytes([
+            (packet_length_high << 4) | packet_length_high_low,
+            (packet_length_low << 4) | packet_length_low_low,
+        ]) == MODERN_PACKET_LENGTH
         && header[28] == Some(0x0)
         && header[29] == Some(0x0)
         && header[30] == Some(0xA)
         && header[31] == Some(0xD)
-}
-
-fn valid_header_bytes(bytes: &[u8]) -> bool {
-    let Some(header) = bytes.get(..HEADER_OFFSET) else {
-        return false;
-    };
-    header[0] == 0xE2
-        && header[1] == 0x25
-        && matches!(
-            u16::from_be_bytes([header[6], header[7]]),
-            MODERN_PACKET_LENGTH | LEGACY_PACKET_LENGTH
-        )
-        && u16::from_be_bytes([header[14], header[15]]) == 0x00AD
 }
 
 fn get_date_time_from_bytes(frame: &[u8]) -> Result<DateTime<Utc>, String> {
@@ -807,4 +717,100 @@ fn valid_detector_nibbles(particle: &[u8]) -> bool {
         let detector = particle[index];
         detector >> 4 <= 8 && detector & 0x0F <= 8
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn packet() -> Vec<u8> {
+        let mut frame = vec![0; 256];
+        frame[..8].copy_from_slice(&[0xE2, 0x25, 0x08, 0xB0, 0xC0, 0x00, 0x00, 0xF7]);
+        frame[14..16].copy_from_slice(&[0x00, 0xAD]);
+        checksum(&mut frame);
+        frame
+    }
+
+    fn checksum(frame: &mut [u8]) {
+        let sum = frame[8..254].iter().map(|&byte| byte as u16).sum::<u16>();
+        frame[254..].copy_from_slice(&sum.to_be_bytes());
+    }
+
+    fn hex(bytes: &[u8]) -> Vec<String> {
+        bytes.iter().map(|byte| format!("{byte:02X}")).collect()
+    }
+
+    #[test]
+    fn particle_milliseconds_and_strip_positions_follow_specification() {
+        let line_time = observation_epoch();
+        let mut processor = ObservationDataProcessor::new();
+        for position in [0x00, 0x18, 0x81] {
+            let mut particle = [0; 34];
+            particle[..2].copy_from_slice(&1500u16.to_be_bytes());
+            for offset in [2, 7, 24, 29] {
+                particle[offset] = position;
+                particle[offset + 1..offset + 3].copy_from_slice(&291u16.to_be_bytes());
+                particle[offset + 3..offset + 5].copy_from_slice(&1110u16.to_be_bytes());
+            }
+            let result = processor.process_particle_data(
+                &hex(&particle), 0, line_time, &LineHeaderFields::default(),
+            ).unwrap();
+            assert_eq!(result.particle_time_raw, 1500);
+            assert_eq!(result.milliseconds, 1500);
+            assert_eq!((result.time - line_time).num_milliseconds(), 1500);
+            assert_eq!(result.dssd_pulses, [(291, 1110); 4]);
+        }
+        for layer in processor.dssd_data.values() {
+            assert_eq!(layer.strip_x[&1], vec![291]);
+            assert_eq!(layer.strip_x[&8], vec![291]);
+            assert_eq!(layer.strip_y[&1], vec![1110]);
+            assert_eq!(layer.strip_y[&8], vec![1110]);
+            assert!(layer.strip_x[&0].is_empty());
+            assert!(layer.strip_y[&0].is_empty());
+            assert_eq!(layer.strip_x.values().map(Vec::len).sum::<usize>(), 2);
+            assert_eq!(layer.strip_y.values().map(Vec::len).sum::<usize>(), 2);
+        }
+    }
+
+    #[test]
+    fn file_processing_validates_frames_and_preserves_reserved_bytes() {
+        let mut valid = packet();
+        valid[186..254].fill(0x5A);
+        let embedded_header = valid[..16].to_vec();
+        valid[190..206].copy_from_slice(&embedded_header);
+        checksum(&mut valid);
+        let mut bad_checksum = valid.clone();
+        bad_checksum[255] ^= 1;
+        let mut wrong_mode = valid.clone();
+        wrong_mode[15] = 0xAC;
+        checksum(&mut wrong_mode);
+        let mut legacy_length = valid.clone();
+        legacy_length[7] = 0x2D;
+        let path = std::env::temp_dir().join(format!("match-observation-{}.txt", std::process::id()));
+        let content = [
+            hex(&valid).concat(),
+            hex(&bad_checksum).concat(),
+            hex(&wrong_mode).concat(),
+            hex(&legacy_length).concat(),
+            hex(&valid[..100]).concat(),
+            hex(&valid).concat(),
+        ].join("\n");
+        fs::write(&path, content).unwrap();
+        let mut processor = ObservationDataProcessor::new();
+        let processed = processor.process_files(&[&path]);
+        fs::remove_file(&path).unwrap();
+        processed.unwrap();
+        assert_eq!(processor.valid_packet_count(), 2);
+        assert_eq!(processor.results.len(), 10);
+        assert_eq!(processor.results[0].line_tail.len(), 2);
+        assert_eq!(processor.results[0].line_tail[0], hex(&valid[186..254]).concat());
+        assert_eq!(processor.results[0].line_tail[1], hex(&valid[254..]).concat());
+
+        let mut direct = ObservationDataProcessor::new();
+        let header = LineHeaderFields::default();
+        direct.process_particles(&hex(&bad_checksum), observation_epoch(), &header);
+        assert!(direct.results.is_empty());
+        direct.process_particles(&hex(&valid), observation_epoch(), &header);
+        assert_eq!(direct.results.len(), 5);
+    }
 }

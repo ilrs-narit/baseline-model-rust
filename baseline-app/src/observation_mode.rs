@@ -71,30 +71,6 @@ struct EventRow {
     line_extra: Arc<[String]>,
 }
 
-/// JSON Structure
-/// `layerParticleCount` layers, in `line_extra` order starting at index 6
-const OBS_JSON_PARTICLE_COUNT_LAYERS: [&str; 6] = ["L2", "L3", "L4", "L5", "L6", "L7"];
-
-/// `housekeeping.dssdfee` keys, in `line_extra` order starting at index 18
-const OBS_JSON_DSSDFEE_KEYS: [&str; 8] = [
-    "dssd1Temperatures",
-    "fee1Current",
-    "fee1Temperature",
-    "dssd7Temperature",
-    "fee2Current",
-    "fee2Temperature",
-    "fee1Threshold",
-    "fee2Threshold",
-];
-
-/// `housekeeping.BGO` keys, in `line_extra` order starting at index 26
-const OBS_JSON_BGO_KEYS: [&str; 4] = [
-    "bgo1BiasVoltage",
-    "bgo2BiasVoltage",
-    "bgo3BiasVoltage",
-    "bgo2Temperature",
-];
-
 /// Particle events per packet - one JSON object groups this many `event_group`
 /// entries, whereas the CSV emits one row each. Matches
 /// `AppConstants::PARTICLES_PER_LINE`.
@@ -135,15 +111,6 @@ fn observation_packet_json(events: &[EventRow]) -> serde_json::Value {
     use crate::json_view::{num_or_str, object};
 
     let first = &events[0];
-    let extra = |i: usize| {
-        first
-            .line_extra
-            .get(i)
-            .map(|s| num_or_str(s))
-            .unwrap_or(serde_json::Value::Null)
-    };
-    // Padding/Checksum stay as their raw hex strings, like the other modes'
-    // reserved/checksum fields.
     let hex_extra = |i: usize| {
         first
             .line_extra
@@ -152,41 +119,6 @@ fn observation_packet_json(events: &[EventRow]) -> serde_json::Value {
             .map(serde_json::Value::from)
             .unwrap_or(serde_json::Value::Null)
     };
-
-    let layer_particle_count = object(OBS_JSON_PARTICLE_COUNT_LAYERS.iter().enumerate().map(|(i, name)| {
-        let base = 6 + i * 2;
-        (
-            name.to_string(),
-            object([
-                ("ionParticle".to_string(), extra(base)),
-                ("electronParticle".to_string(), extra(base + 1)),
-            ]),
-        )
-    }));
-    let dssdfee = object(
-        OBS_JSON_DSSDFEE_KEYS
-            .iter()
-            .enumerate()
-            .map(|(i, key)| (key.to_string(), extra(18 + i))),
-    );
-    let bgo = object(
-        OBS_JSON_BGO_KEYS
-            .iter()
-            .enumerate()
-            .map(|(i, key)| (key.to_string(), extra(26 + i))),
-    );
-
-    let housekeeping = object([
-        ("galacticElectronCount".to_string(), extra(0)),
-        ("albedoElectronCount".to_string(), extra(1)),
-        ("galacticIonCount".to_string(), extra(2)),
-        ("albedoIonCount".to_string(), extra(3)),
-        ("L1IonThreshold".to_string(), extra(4)),
-        ("L1ElectronThreshold".to_string(), extra(5)),
-        ("layerParticleCount".to_string(), layer_particle_count),
-        ("dssdfee".to_string(), dssdfee),
-        ("BGO".to_string(), bgo),
-    ]);
 
     object([
         (
@@ -207,9 +139,8 @@ fn observation_packet_json(events: &[EventRow]) -> serde_json::Value {
                 serde_json::Value::Array(events.iter().map(observation_particle_json).collect()),
             )]),
         ),
-        ("housekeeping".to_string(), housekeeping),
-        ("padding".to_string(), hex_extra(30)),
-        ("checksum".to_string(), hex_extra(31)),
+        ("reserved".to_string(), hex_extra(0)),
+        ("checksum".to_string(), hex_extra(1)),
     ])
 }
 
@@ -219,6 +150,35 @@ fn observation_events_json(events: &[EventRow]) -> Vec<serde_json::Value> {
         .chunks(PARTICLES_PER_PACKET)
         .map(observation_packet_json)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observation_json_keeps_reserved_bytes_without_inventing_telemetry() {
+        let event = EventRow {
+            packet_sync: "E225".to_string(),
+            package_id: 0x08B0,
+            packet_sequence: 0xC000,
+            packet_data_length: 0x00F7,
+            time: DateTime::from_timestamp(0, 0).unwrap(),
+            data_type: "00AD".to_string(),
+            particle_time_raw: 1500,
+            dssd_position: [0; 4],
+            dssd: [(0, 0); 4],
+            bgo: [(0, 0); 3],
+            line_extra: Arc::from(vec!["5A".repeat(68), "18C0".to_string()]),
+        };
+        let json = observation_events_json(&vec![event; 5]);
+        assert_eq!(json.len(), 1);
+        assert_eq!(json[0]["reserved"], "5A".repeat(68));
+        assert_eq!(json[0]["checksum"], "18C0");
+        assert_eq!(json[0]["data"]["event_group"][0]["particleTime"], 1500);
+        assert!(json[0].get("housekeeping").is_none());
+        assert!(json[0].get("padding").is_none());
+    }
 }
 
 /// 14-bit ADC channel -> volts
@@ -1846,7 +1806,7 @@ fn analyze_files_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>, run_id: u64)
                     package_id: r.package_id,
                     packet_sequence: r.packet_sequence,
                     packet_data_length: r.packet_data_length,
-                    time: r.time,
+                    time: r.time - chrono::Duration::milliseconds(r.particle_time_raw as i64),
                     data_type: r.data_type,
                     particle_time_raw: r.particle_time_raw,
                     dssd_position: r.dssd_positions,

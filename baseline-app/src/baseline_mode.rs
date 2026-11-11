@@ -1,7 +1,7 @@
 //! Port of Baseline mode: Running file I/O, Excel, per-channel fits runs on a
 //! background thread and reports back over an `mpsc` channel
 
-use baseline_core::baseline_data_table::{parse_baseline_line, BaselineLineResult, BASELINE_TAIL_FIELDS};
+use baseline_core::baseline_data_table::{parse_baseline_line, BaselineLineResult};
 use baseline_core::io;
 use baseline_core::io::segment_filter::filter_e225_segments_from_files;
 use baseline_core::math::MathService;
@@ -23,7 +23,7 @@ enum BaselineTab {
     Json,
 }
 
-/// One decoded raw line for the Data Table tab. Each of the 16
+/// One decoded raw line for the Data Table tab. Each of the 15
 /// Data-Acquisition blocks per layer (L1/L2/L6/L7) holds 16 decoded
 /// per-channel values.
 #[derive(Debug, Clone)]
@@ -39,8 +39,6 @@ struct BaselineRow {
     l2_blocks: Vec<Vec<i32>>,
     l6_blocks: Vec<Vec<i32>>,
     l7_blocks: Vec<Vec<i32>>,
-    /// Values for `BASELINE_TAIL_FIELDS`, in that same order.
-    tail: Vec<String>,
     reserved_hex: String,
     checksum_hex: String,
 }
@@ -59,7 +57,6 @@ impl From<BaselineLineResult> for BaselineRow {
             l2_blocks: r.l2_blocks,
             l6_blocks: r.l6_blocks,
             l7_blocks: r.l7_blocks,
-            tail: r.tail,
             reserved_hex: r.reserved_hex,
             checksum_hex: r.checksum_hex,
         }
@@ -131,10 +128,7 @@ fn baseline_table_headers() -> Vec<String> {
             headers.push(format!("{layer} Data Acquisition-{} (Byte {start}-{end})", i + 1));
         }
     }
-    for field in BASELINE_TAIL_FIELDS {
-        headers.push(format!("{} (Byte {}-{})", field.label, field.byte_start, field.byte_start + 1));
-    }
-    headers.push("Reserved (Byte 1958-2061)".to_string());
+    headers.push("Reserved (Byte 1938-2061)".to_string());
     headers.push("Checksum (Byte 2062-2063)".to_string());
     headers
 }
@@ -164,7 +158,6 @@ fn baseline_row_cells(row: &BaselineRow) -> Vec<String> {
         cells.push(join_i32_values(&row.l6_blocks[i]));
         cells.push(join_i32_values(&row.l7_blocks[i]));
     }
-    cells.extend(row.tail.iter().cloned());
     cells.push(row.reserved_hex.clone());
     cells.push(row.checksum_hex.clone());
     cells
@@ -180,20 +173,6 @@ fn csv_field(value: &str) -> String {
     }
 }
 
-/// Housekeeping `dssdfee` keys for the JSON view
-const BASELINE_JSON_TAIL_KEYS: [&str; 10] = [
-    "dssd1Temperatures",
-    "fee1Current",
-    "fee1Temperature",
-    "dssd7Temperature",
-    "fee2Current",
-    "fee2Temperature",
-    "fee1Threshold",
-    "fee2Threshold",
-    "dssd1TemperatureDup",
-    "dssd4Temperature",
-];
-
 /// One Data Table row as a JSON object matching
 fn baseline_row_json(row: &BaselineRow) -> serde_json::Value {
     use crate::json_view::{num_or_str, object};
@@ -207,13 +186,6 @@ fn baseline_row_json(row: &BaselineRow) -> serde_json::Value {
         data_acquisition.push((format!("L6_{}", i + 1), serde_json::Value::from(row.l6_blocks[i].clone())));
         data_acquisition.push((format!("L7_{}", i + 1), serde_json::Value::from(row.l7_blocks[i].clone())));
     }
-
-    let dssdfee = object(
-        BASELINE_JSON_TAIL_KEYS
-            .iter()
-            .zip(&row.tail)
-            .map(|(k, v)| (k.to_string(), num_or_str(v))),
-    );
 
     object([
         (
@@ -233,10 +205,6 @@ fn baseline_row_json(row: &BaselineRow) -> serde_json::Value {
                 ("sampleIndex".to_string(), row.sample_index.into()),
                 ("dataAcquisition".to_string(), object(data_acquisition)),
             ]),
-        ),
-        (
-            "housekeeping".to_string(),
-            object([("dssdfee".to_string(), dssdfee)]),
         ),
         ("reserved".to_string(), row.reserved_hex.clone().into()),
         ("checksum".to_string(), row.checksum_hex.clone().into()),
